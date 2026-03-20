@@ -1,7 +1,7 @@
 //! Build script for RustJay Waaaves
 //!
 //! Links the local Syphon framework for inter-app video on macOS.
-//! This uses the framework from ../crates/syphon/syphon-lib/ rather than
+//! This uses the framework from ../syphon-rs/syphon-lib/ rather than
 //! the system framework, avoiding install name issues.
 
 use std::path::PathBuf;
@@ -45,7 +45,7 @@ fn link_local_syphon_framework() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", framework_full.display());
         
         // Also add an rpath that works from the target directory (for cargo run)
-        println!("cargo:rustc-link-arg=-Wl,-rpath,../crates/syphon/syphon-lib");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,../syphon-rs/syphon-lib");
         
         println!("cargo:warning=✅ Using local Syphon.framework from: {}", framework_full.display());
         
@@ -71,7 +71,7 @@ fn link_local_syphon_framework() {
         println!("cargo:warning=   The app may fail to run with 'Library not loaded' error.");
         println!("cargo:warning=   ");
         println!("cargo:warning=   To fix, ensure the framework exists at:");
-        println!("cargo:warning=     crates/syphon/syphon-lib/Syphon.framework/");
+        println!("cargo:warning=     syphon-rs/syphon-lib/Syphon.framework/");
     }
     
     // Link required frameworks (Metal, IOSurface, etc. are system frameworks)
