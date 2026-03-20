@@ -122,6 +122,10 @@ The rendering pipeline consists of three main blocks:
   - Low-latency frame receiving with background threading
   - Supports BGRA/BGRX formats with automatic conversion
   - Configurable bandwidth (highest quality by default)
+- **Syphon Input** (macOS only) - Zero-copy GPU texture sharing from other applications
+  - Automatic server discovery
+  - UUID-based connection to avoid name conflicts
+  - Native BGRA format, no conversion overhead
 - Spout input (Windows only, planned)
 - Video file playback (planned)
 
@@ -133,6 +137,9 @@ The rendering pipeline consists of three main blocks:
   - Dedicated send thread for low-latency streaming
   - Configurable source name for easy discovery
   - BGRA/BGRX format support with alpha channel option
+- **Syphon Output** (macOS only) - Share output as a Syphon server for other apps
+  - Zero-copy GPU-to-GPU via IOSurface
+  - Visible to Resolume, VDMX, MadMapper, and any Syphon-enabled app
 - Video recording (planned)
 
 ## Building
@@ -142,6 +149,7 @@ The rendering pipeline consists of three main blocks:
 - Rust 1.75+ (latest stable recommended)
 - OpenGL 3.3 compatible GPU (or Metal via wgpu)
 - macOS, Windows, or Linux
+- Syphon.framework (macOS, bundled via `syphon-rs` — see below)
 
 ### Dependencies
 
@@ -154,6 +162,21 @@ Key dependencies:
 - `midir` - Cross-platform MIDI input
 - `serde` + `toml` - Configuration
 - `grafton-ndi 0.11` - NDI input/output support
+
+### Syphon Setup (macOS Only)
+
+Syphon support is enabled by default. The build system finds the framework automatically at `../syphon-rs/syphon-lib/Syphon.framework` (the sibling `syphon-rs` repo).
+
+If your layout differs, set `SYPHON_FRAMEWORK_DIR` before building:
+
+```bash
+SYPHON_FRAMEWORK_DIR=/path/to/syphon-rs/syphon-lib cargo build --release
+```
+
+To disable Syphon entirely:
+```bash
+cargo build --release --no-default-features --features "webcam ndi"
+```
 
 ### Build Commands
 
@@ -373,7 +396,7 @@ Original shaders and design concept by Andrei Jay.
 - [x] Audio analysis and reactivity
 - [ ] TouchOSC integration
 - [x] Preset system
-- [ ] Syphon output (macOS)
+- [x] Syphon input/output (macOS)
 
 ## Troubleshooting
 
@@ -431,6 +454,23 @@ If you're running a DAW (Digital Audio Workstation) or other MIDI applications:
 - The async triple-buffered implementation minimizes overhead
 - If dropping frames, check network bandwidth (1080p60 ~250Mbps)
 - Consider lowering resolution or frame rate in Settings
+
+### Syphon Issues
+
+**"Library not loaded: Syphon.framework" at runtime:**
+1. Verify the framework exists: `ls ../syphon-rs/syphon-lib/Syphon.framework`
+2. Ensure you cloned `syphon-rs` as a sibling to this repo
+3. If your layout differs: `SYPHON_FRAMEWORK_DIR=/path/to/syphon-rs/syphon-lib cargo build --release`
+
+**Syphon server not appearing in other apps:**
+- Check macOS Local Network permissions for the app
+- Syphon uses Bonjour — ensure mDNS is not blocked by firewall
+- Try SyphonInject or SyphonVirtualScreen to verify Syphon is working system-wide
+
+**No Syphon servers appearing in the input list:**
+- Click "Refresh" in the Inputs tab
+- Ensure the sending application has Syphon output enabled
+- Both apps must be running on the same machine
 
 ## Support
 
