@@ -1,11 +1,11 @@
 [package]
-name = "rustjay_waaaves"
+name = "rustjay-waaaves"
 version = "0.1.0"
 edition = "2021"
-authors = ["VJ Developer"]
+authors = ["BlueJayLouche <bluejaylouche@gmail.com>"]
 description = "High-performance VJ application in Rust with wgpu shaders"
 license = "MIT"
-repository = "https://github.com/yourusername/rustjay_waaaves"
+repository = "https://github.com/BlueJayLouche/rustjay-waaaves"
 keywords = ["vj", "visuals", "wgpu", "shaders", "real-time"]
 categories = ["graphics", "multimedia"]
 build = "build.rs"
@@ -64,6 +64,9 @@ grafton-ndi = { version = "0.11", optional = true }
 
 # Time and scheduling
 instant = "0.1"
+
+# OS config directory lookup
+dirs = "5"
 
 # GUI - imgui for wgpu
 imgui = "0.12"
