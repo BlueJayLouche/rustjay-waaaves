@@ -75,8 +75,8 @@ imgui-winit-support = "0.13"
 
 # Syphon crate (local path)
 # Provides zero-copy GPU-to-GPU Syphon output for macOS
-syphon-core = { path = "../crates/syphon/syphon-core", optional = true }
-syphon-wgpu = { path = "../crates/syphon/syphon-wgpu", optional = true }
+syphon-core = { path = "../syphon-rs/syphon-core", optional = true }
+syphon-wgpu = { path = "../syphon-rs/syphon-wgpu", optional = true }
 
 
 
@@ -128,7 +128,7 @@ icon = ["icons/32x32.png", "icons/128x128.png", "icons/icon.icns"]
 version = "0.1.0"
 # Embed the local Syphon framework into the app bundle
 # This path is relative to the crate root (where Cargo.toml is)
-resources = ["../crates/syphon/syphon-lib/Syphon.framework"]
+resources = ["../syphon-rs/syphon-lib/Syphon.framework"]
 copyright = "Copyright (c) 2024"
 category = "Developer Tool"
 short_description = "High-performance VJ application"
