@@ -18,6 +18,7 @@ use glam::{Vec3, Vec4};
 use imgui::{CollapsingHeader, ComboBox, Condition, Drag, Ui};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 // =============================================================================
 // CONSTANTS
@@ -182,12 +183,14 @@ pub struct ControlGui {
     pub selected_webcam1: i32,
     pub selected_webcam2: i32,
     pub webcam_devices: Vec<String>,
+    webcam_discovery: Option<JoinHandle<Vec<String>>>,
     
     // NDI source selection
     pub ndi_sources: Vec<String>,
     pub selected_ndi_source1: i32,
     pub selected_ndi_source2: i32,
     pub ndi_sources_dirty: bool,
+    ndi_discovery: Option<JoinHandle<Vec<String>>>,
     // Saved NDI source names from config (for matching after discovery)
     pub saved_ndi_source1: String,
     pub saved_ndi_source2: String,
@@ -197,6 +200,7 @@ pub struct ControlGui {
     pub selected_syphon_source1: i32,
     pub selected_syphon_source2: i32,
     pub syphon_sources_dirty: bool,
+    syphon_discovery: Option<JoinHandle<Vec<String>>>,
     // Saved Syphon source names from config (for matching after discovery)
     pub saved_syphon_source1: String,
     pub saved_syphon_source2: String,
@@ -205,6 +209,7 @@ pub struct ControlGui {
     pub audio_devices: Vec<String>,
     pub selected_audio_device: i32,
     pub audio_device_dirty: bool,
+    audio_discovery: Option<JoinHandle<Vec<String>>>,
     
     // Audio modulation UI state
     show_audio_panel: bool,
@@ -317,16 +322,8 @@ impl ControlGui {
             (state.block1, state.block2, state.block3)
         };
         
-        // Load webcam devices
-        #[cfg(feature = "webcam")]
-        let webcam_devices = crate::input::webcam::list_cameras();
-        #[cfg(not(feature = "webcam"))]
         let webcam_devices: Vec<String> = Vec::new();
-        log::info!("Found {} webcam device(s)", webcam_devices.len());
-        
-        // Load audio devices
-        let audio_devices = crate::audio::AudioInput::list_devices();
-        log::info!("Found {} audio device(s)", audio_devices.len());
+        let audio_devices: Vec<String> = Vec::new();
         
         // Load input settings from config
         // Note: Input type values: 0=None, 1=Webcam, 2=NDI, 3=Syphon, 4=Spout, 5=VideoFile
@@ -350,14 +347,12 @@ impl ControlGui {
         };
         
         // Validate device indices
-        let selected_webcam1 = if config.inputs.input1_device >= 0 
-            && (config.inputs.input1_device as usize) < webcam_devices.len() {
+        let selected_webcam1 = if config.inputs.input1_device >= 0 {
             config.inputs.input1_device
         } else {
             -1
         };
-        let selected_webcam2 = if config.inputs.input2_device >= 0 
-            && (config.inputs.input2_device as usize) < webcam_devices.len() {
+        let selected_webcam2 = if config.inputs.input2_device >= 0 {
             config.inputs.input2_device
         } else {
             -1
@@ -374,7 +369,7 @@ impl ControlGui {
         log::info!("Saved sources: NDI1='{}', NDI2='{}', Syphon1='{}', Syphon2='{}'",
             saved_ndi_source1, saved_ndi_source2, saved_syphon_source1, saved_syphon_source2);
         
-        Ok(Self {
+        let mut gui = Self {
             shared_state,
             config: config.clone(),
             show_demo: false,
@@ -400,21 +395,25 @@ impl ControlGui {
             selected_webcam1,
             selected_webcam2,
             webcam_devices,
+            webcam_discovery: None,
             ndi_sources: Vec::new(),
             selected_ndi_source1: -1,
             selected_ndi_source2: -1,
             ndi_sources_dirty: true, // Mark as dirty to trigger initial scan
+            ndi_discovery: None,
             saved_ndi_source1,
             saved_ndi_source2,
             syphon_sources: Vec::new(),
             selected_syphon_source1: -1,
             selected_syphon_source2: -1,
             syphon_sources_dirty: true,
+            syphon_discovery: None,
             saved_syphon_source1,
             saved_syphon_source2,
             audio_devices,
             selected_audio_device: -1,
-            audio_device_dirty: false,
+            audio_device_dirty: true,
+            audio_discovery: None,
             show_audio_panel: false,
             selected_block1_param: 0,
             selected_block2_param: 0,
@@ -484,7 +483,12 @@ impl ControlGui {
             // Deferred input startup
             startup_frame_count: 0,
             syphon_start_pending: [false, false],
-        })
+        };
+        
+        gui.refresh_devices();
+        gui.refresh_syphon_sources();
+        
+        Ok(gui)
     }
     
     /// Set the preview texture ID (registered with imgui-wgpu)
@@ -565,55 +569,170 @@ impl ControlGui {
     
     /// Refresh the list of available devices
     fn refresh_devices(&mut self) {
-        // Scan for webcam devices
+        self.begin_webcam_refresh();
+        self.begin_audio_refresh();
+        self.refresh_ndi_sources();
+    }
+    
+    /// Refresh the list of available NDI sources
+    fn refresh_ndi_sources(&mut self) {
+        if self.ndi_discovery.is_some() {
+            return;
+        }
+        self.ndi_sources_dirty = true;
+        self.ndi_discovery = Some(std::thread::spawn(|| crate::input::list_ndi_sources(1000)));
+    }
+    
+    /// Refresh the list of available Syphon servers (macOS only, requires syphon feature)
+    #[cfg(all(target_os = "macos", feature = "syphon"))]
+    fn refresh_syphon_sources(&mut self) {
+        if self.syphon_discovery.is_some() {
+            return;
+        }
+        self.syphon_sources_dirty = true;
+        self.syphon_discovery = Some(std::thread::spawn(|| {
+            use crate::input::SyphonServerInfo;
+            let discovery = crate::input::SyphonDiscovery::new();
+            let servers: Vec<SyphonServerInfo> = discovery.discover_servers();
+            servers
+                .into_iter()
+                .map(|s| s.display_name().to_string())
+                .collect()
+        }));
+    }
+    
+    /// Stub for non-macOS platforms or when syphon feature is disabled
+    #[cfg(not(all(target_os = "macos", feature = "syphon")))]
+    fn refresh_syphon_sources(&mut self) {
+        self.syphon_sources.clear();
+        self.syphon_sources_dirty = false;
+    }
+
+    fn begin_webcam_refresh(&mut self) {
+        if self.webcam_discovery.is_some() {
+            return;
+        }
         #[cfg(feature = "webcam")]
         {
-            self.webcam_devices = crate::input::webcam::list_cameras();
-            log::info!("Refreshed device list: {} webcam(s) found", self.webcam_devices.len());
+            self.webcam_discovery = Some(std::thread::spawn(|| crate::input::webcam::list_cameras()));
         }
         #[cfg(not(feature = "webcam"))]
         {
             self.webcam_devices.clear();
-            log::info!("Webcam feature disabled, no devices found");
         }
-        
-        // Scan for audio devices
-        self.audio_devices = crate::audio::AudioInput::list_devices();
-        log::info!("Refreshed device list: {} audio device(s) found", self.audio_devices.len());
-        
-        // Scan for NDI sources
-        self.refresh_ndi_sources();
-        
-        // Reset selections if they're now out of bounds
+    }
+
+    fn begin_audio_refresh(&mut self) {
+        if self.audio_discovery.is_some() {
+            return;
+        }
+        self.audio_device_dirty = true;
+        self.audio_discovery = Some(std::thread::spawn(crate::audio::AudioInput::list_devices));
+    }
+
+    fn poll_async_discovery(&mut self) {
+        if let Some(handle) = self.webcam_discovery.as_ref() {
+            if handle.is_finished() {
+                if let Some(handle) = self.webcam_discovery.take() {
+                    match handle.join() {
+                        Ok(devices) => {
+                            log::info!("Refreshed device list: {} webcam(s) found", devices.len());
+                            self.webcam_devices = devices;
+                            self.clamp_webcam_selection();
+                        }
+                        Err(_) => {
+                            log::error!("[GUI] Webcam discovery thread panicked");
+                            self.webcam_devices.clear();
+                            self.clamp_webcam_selection();
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(handle) = self.audio_discovery.as_ref() {
+            if handle.is_finished() {
+                if let Some(handle) = self.audio_discovery.take() {
+                    match handle.join() {
+                        Ok(devices) => {
+                            log::info!("Refreshed device list: {} audio device(s) found", devices.len());
+                            self.audio_devices = devices;
+                        }
+                        Err(_) => {
+                            log::error!("[GUI] Audio discovery thread panicked");
+                            self.audio_devices.clear();
+                        }
+                    }
+                    self.audio_device_dirty = false;
+                    if self.selected_audio_device >= 0 && (self.selected_audio_device as usize) >= self.audio_devices.len() {
+                        self.selected_audio_device = -1;
+                    }
+                }
+            }
+        }
+
+        if let Some(handle) = self.ndi_discovery.as_ref() {
+            if handle.is_finished() {
+                if let Some(handle) = self.ndi_discovery.take() {
+                    match handle.join() {
+                        Ok(sources) => {
+                            self.ndi_sources = sources;
+                            self.ndi_sources_dirty = false;
+                            self.match_saved_ndi_sources();
+                        }
+                        Err(_) => {
+                            log::error!("[GUI] NDI discovery thread panicked");
+                            self.ndi_sources.clear();
+                            self.ndi_sources_dirty = false;
+                        }
+                    }
+                    if self.selected_ndi_source1 >= 0 && (self.selected_ndi_source1 as usize) >= self.ndi_sources.len() {
+                        self.selected_ndi_source1 = -1;
+                    }
+                    if self.selected_ndi_source2 >= 0 && (self.selected_ndi_source2 as usize) >= self.ndi_sources.len() {
+                        self.selected_ndi_source2 = -1;
+                    }
+                }
+            }
+        }
+
+        #[cfg(all(target_os = "macos", feature = "syphon"))]
+        if let Some(handle) = self.syphon_discovery.as_ref() {
+            if handle.is_finished() {
+                if let Some(handle) = self.syphon_discovery.take() {
+                    match handle.join() {
+                        Ok(sources) => {
+                            self.syphon_sources = sources;
+                            self.syphon_sources_dirty = false;
+                            self.match_saved_syphon_sources();
+                        }
+                        Err(_) => {
+                            log::error!("[GUI] Syphon discovery thread panicked");
+                            self.syphon_sources.clear();
+                            self.syphon_sources_dirty = false;
+                        }
+                    }
+                    if self.selected_syphon_source1 >= 0 && (self.selected_syphon_source1 as usize) >= self.syphon_sources.len() {
+                        self.selected_syphon_source1 = -1;
+                    }
+                    if self.selected_syphon_source2 >= 0 && (self.selected_syphon_source2 as usize) >= self.syphon_sources.len() {
+                        self.selected_syphon_source2 = -1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn clamp_webcam_selection(&mut self) {
         if self.selected_webcam1 >= 0 && (self.selected_webcam1 as usize) >= self.webcam_devices.len() {
             self.selected_webcam1 = -1;
         }
         if self.selected_webcam2 >= 0 && (self.selected_webcam2 as usize) >= self.webcam_devices.len() {
             self.selected_webcam2 = -1;
         }
-        if self.selected_audio_device >= 0 && (self.selected_audio_device as usize) >= self.audio_devices.len() {
-            self.selected_audio_device = -1;
-        }
-        if self.selected_ndi_source1 >= 0 && (self.selected_ndi_source1 as usize) >= self.ndi_sources.len() {
-            self.selected_ndi_source1 = -1;
-        }
-        if self.selected_ndi_source2 >= 0 && (self.selected_ndi_source2 as usize) >= self.ndi_sources.len() {
-            self.selected_ndi_source2 = -1;
-        }
-        if self.selected_syphon_source1 >= 0 && (self.selected_syphon_source1 as usize) >= self.syphon_sources.len() {
-            self.selected_syphon_source1 = -1;
-        }
-        if self.selected_syphon_source2 >= 0 && (self.selected_syphon_source2 as usize) >= self.syphon_sources.len() {
-            self.selected_syphon_source2 = -1;
-        }
     }
-    
-    /// Refresh the list of available NDI sources
-    fn refresh_ndi_sources(&mut self) {
-        self.ndi_sources = crate::input::list_ndi_sources(1000);
-        self.ndi_sources_dirty = false;
-        
-        // Try to match saved sources if currently not selected
+
+    fn match_saved_ndi_sources(&mut self) {
         if self.selected_ndi_source1 < 0 && !self.saved_ndi_source1.is_empty() {
             if let Some(idx) = self.ndi_sources.iter().position(|s| s == &self.saved_ndi_source1) {
                 self.selected_ndi_source1 = idx as i32;
@@ -627,20 +746,9 @@ impl ControlGui {
             }
         }
     }
-    
-    /// Refresh the list of available Syphon servers (macOS only, requires syphon feature)
+
     #[cfg(all(target_os = "macos", feature = "syphon"))]
-    fn refresh_syphon_sources(&mut self) {
-        use crate::input::SyphonServerInfo;
-        let discovery = crate::input::SyphonDiscovery::new();
-        let servers: Vec<SyphonServerInfo> = discovery.discover_servers();
-        // Use display_name() which handles empty names automatically
-        self.syphon_sources = servers.into_iter()
-            .map(|s| s.display_name().to_string())
-            .collect();
-        self.syphon_sources_dirty = false;
-        
-        // Try to match saved sources if currently not selected
+    fn match_saved_syphon_sources(&mut self) {
         if self.selected_syphon_source1 < 0 && !self.saved_syphon_source1.is_empty() {
             if let Some(idx) = self.syphon_sources.iter().position(|s| s == &self.saved_syphon_source1) {
                 self.selected_syphon_source1 = idx as i32;
@@ -653,13 +761,6 @@ impl ControlGui {
                 log::info!("[GUI] Matched saved Syphon source 2: {} at index {}", self.saved_syphon_source2, idx);
             }
         }
-    }
-    
-    /// Stub for non-macOS platforms or when syphon feature is disabled
-    #[cfg(not(all(target_os = "macos", feature = "syphon")))]
-    fn refresh_syphon_sources(&mut self) {
-        self.syphon_sources.clear();
-        self.syphon_sources_dirty = false;
     }
     
     /// Save current input settings to config file
@@ -744,40 +845,36 @@ impl ControlGui {
         if self.input1_type == InputType::Webcam && self.selected_webcam1 >= 0 {
             let device_index = self.selected_webcam1 as usize;
             if device_index < self.webcam_devices.len() {
-                log::info!("Auto-starting Webcam 1 (device {}: {})", 
-                    device_index, self.webcam_devices[device_index]);
-                if let Ok(mut state) = self.shared_state.lock() {
-                    state.input1_change_request = crate::core::InputChangeRequest::StartWebcam { 
-                        input_id: 1,
-                        device_index,
-                        width: 1280,
-                        height: 720,
-                        fps: 30,
-                    };
-                }
+                log::info!("Auto-starting Webcam 1 (device {}: {})", device_index, self.webcam_devices[device_index]);
             } else {
-                log::warn!("Webcam 1 device index {} out of bounds ({} devices)", 
-                    device_index, self.webcam_devices.len());
+                log::info!("Auto-starting Webcam 1 using saved device index {}", device_index);
+            }
+            if let Ok(mut state) = self.shared_state.lock() {
+                state.input1_change_request = crate::core::InputChangeRequest::StartWebcam { 
+                    input_id: 1,
+                    device_index,
+                    width: 1280,
+                    height: 720,
+                    fps: 30,
+                };
             }
         }
         
         if self.input2_type == InputType::Webcam && self.selected_webcam2 >= 0 {
             let device_index = self.selected_webcam2 as usize;
             if device_index < self.webcam_devices.len() {
-                log::info!("Auto-starting Webcam 2 (device {}: {})", 
-                    device_index, self.webcam_devices[device_index]);
-                if let Ok(mut state) = self.shared_state.lock() {
-                    state.input2_change_request = crate::core::InputChangeRequest::StartWebcam { 
-                        input_id: 2,
-                        device_index,
-                        width: 1280,
-                        height: 720,
-                        fps: 30,
-                    };
-                }
+                log::info!("Auto-starting Webcam 2 (device {}: {})", device_index, self.webcam_devices[device_index]);
             } else {
-                log::warn!("Webcam 2 device index {} out of bounds ({} devices)", 
-                    device_index, self.webcam_devices.len());
+                log::info!("Auto-starting Webcam 2 using saved device index {}", device_index);
+            }
+            if let Ok(mut state) = self.shared_state.lock() {
+                state.input2_change_request = crate::core::InputChangeRequest::StartWebcam { 
+                    input_id: 2,
+                    device_index,
+                    width: 1280,
+                    height: 720,
+                    fps: 30,
+                };
             }
         }
         
@@ -832,7 +929,7 @@ impl ControlGui {
             1 if self.input1_type == InputType::Syphon && !self.saved_syphon_source1.is_empty() => {
                 log::info!("Starting deferred Syphon Input 1: {}", self.saved_syphon_source1);
                 if let Ok(mut state) = self.shared_state.lock() {
-                    state.input1_change_request = crate::core::InputChangeRequest::StartSyphon { 
+                    state.input1_change_request = crate::core::InputChangeRequest::StartSyphon {
                         input_id: 1,
                         server_name: self.saved_syphon_source1.clone(),
                     };
@@ -841,7 +938,7 @@ impl ControlGui {
             2 if self.input2_type == InputType::Syphon && !self.saved_syphon_source2.is_empty() => {
                 log::info!("Starting deferred Syphon Input 2: {}", self.saved_syphon_source2);
                 if let Ok(mut state) = self.shared_state.lock() {
-                    state.input2_change_request = crate::core::InputChangeRequest::StartSyphon { 
+                    state.input2_change_request = crate::core::InputChangeRequest::StartSyphon {
                         input_id: 2,
                         server_name: self.saved_syphon_source2.clone(),
                     };
@@ -878,6 +975,7 @@ impl ControlGui {
     pub fn build_ui(&mut self, ui: &mut Ui) {
         // Process deferred startups (e.g., Syphon inputs that need to wait for event loop stabilization)
         self.process_deferred_startups();
+        self.poll_async_discovery();
         
         // Update FPS counter (average over last 60 frames for smooth display)
         let now = std::time::Instant::now();
@@ -4642,9 +4740,9 @@ impl ControlGui {
                         let source_name = self.syphon_sources[self.selected_syphon_source1 as usize].clone();
                         log::info!("[GUI] Requesting Syphon Input 1: {}", source_name);
                         if let Ok(mut state) = self.shared_state.lock() {
-                            state.input1_change_request = InputChangeRequest::StartSyphon { 
-                                input_id: 1, 
-                                server_name: source_name 
+                            state.input1_change_request = InputChangeRequest::StartSyphon {
+                                input_id: 1,
+                                server_name: source_name,
                             };
                         }
                     }
@@ -4869,9 +4967,9 @@ impl ControlGui {
                         let source_name = self.syphon_sources[self.selected_syphon_source2 as usize].clone();
                         log::info!("[GUI] Requesting Syphon Input 2: {}", source_name);
                         if let Ok(mut state) = self.shared_state.lock() {
-                            state.input2_change_request = InputChangeRequest::StartSyphon { 
-                                input_id: 2, 
-                                server_name: source_name 
+                            state.input2_change_request = InputChangeRequest::StartSyphon {
+                                input_id: 2,
+                                server_name: source_name,
                             };
                         }
                     }
@@ -5131,13 +5229,17 @@ impl ControlGui {
             let scale_labels = ["100%", "150%", "200%", "250%", "300%"];
             
             // Find current preset index (closest match)
-            let current_scale = self.config.ui_scale;
+            let current_scale = if self.config.ui_scale.is_finite() {
+                self.config.ui_scale
+            } else {
+                2.0
+            };
             let mut selected_idx = scale_presets.iter()
                 .enumerate()
                 .min_by(|(_, a), (_, b)| {
                     let diff_a = (**a - current_scale).abs();
                     let diff_b = (**b - current_scale).abs();
-                    diff_a.partial_cmp(&diff_b).unwrap()
+                    diff_a.total_cmp(&diff_b)
                 })
                 .map(|(i, _)| i)
                 .unwrap_or(2); // Default to 200%

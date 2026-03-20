@@ -564,7 +564,7 @@ impl ModularBlock1 {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -961,7 +961,7 @@ impl ModularBlock1 {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1748,7 +1748,7 @@ impl ModularBlock1 {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -2401,6 +2401,22 @@ impl ModularBlock1 {
     /// Update feedback for next frame
     pub fn update_feedback(&self, encoder: &mut wgpu::CommandEncoder) {
         self.resources.update_feedback(encoder);
+    }
+
+    /// Clear all internal buffers (feedback + ping-pong) to black.
+    /// Call on input switch to avoid stale frames bleeding through the feedback path.
+    pub fn clear_all(&self, queue: &wgpu::Queue) {
+        self.resources.clear_all(queue);
+    }
+
+    /// Invalidate the bind group caches.
+    ///
+    /// Required on input switch because the cache keys are raw pointer addresses.
+    /// When the old texture is dropped and a new one allocated, the allocator may
+    /// reuse the same address — causing a stale cache hit that renders the old frame.
+    pub fn invalidate_bind_group_caches(&self) {
+        self.stage1_bind_group_cache.borrow_mut().clear();
+        self.stage2_bind_group_cache.borrow_mut().clear();
     }
     
     /// Create a sampler

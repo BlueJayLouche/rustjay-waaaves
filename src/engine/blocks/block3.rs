@@ -177,20 +177,20 @@ impl ModularBlock3 {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) -> Self {
         // Create ping-pong buffers for Block 1 re-processing
         let block1_buffer_a = Texture::create_render_target_with_format(
-            device, width, height, "Block3 B1 Buffer A", wgpu::TextureFormat::Rgba8Unorm,
+            device, width, height, "Block3 B1 Buffer A", wgpu::TextureFormat::Bgra8Unorm,
         );
         let block1_buffer_b = Texture::create_render_target_with_format(
-            device, width, height, "Block3 B1 Buffer B", wgpu::TextureFormat::Rgba8Unorm,
+            device, width, height, "Block3 B1 Buffer B", wgpu::TextureFormat::Bgra8Unorm,
         );
         block1_buffer_a.clear_to_black(queue);
         block1_buffer_b.clear_to_black(queue);
         
         // Create ping-pong buffers for Block 2 re-processing
         let block2_buffer_a = Texture::create_render_target_with_format(
-            device, width, height, "Block3 B2 Buffer A", wgpu::TextureFormat::Rgba8Unorm,
+            device, width, height, "Block3 B2 Buffer A", wgpu::TextureFormat::Bgra8Unorm,
         );
         let block2_buffer_b = Texture::create_render_target_with_format(
-            device, width, height, "Block3 B2 Buffer B", wgpu::TextureFormat::Rgba8Unorm,
+            device, width, height, "Block3 B2 Buffer B", wgpu::TextureFormat::Bgra8Unorm,
         );
         block2_buffer_a.clear_to_black(queue);
         block2_buffer_b.clear_to_black(queue);
@@ -866,7 +866,7 @@ impl ModularBlock3 {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1308,7 +1308,7 @@ impl ModularBlock3 {
             push_constant_ranges: &[],
         });
         
-        // Determine output format - use Rgba8Unorm for intermediate, surface format will be handled by blit
+        // Determine output format - use Bgra8Unorm (macOS native) for intermediate; surface blit handles sRGB
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Block3 Stage2 Pipeline"),
             layout: Some(&pipeline_layout),
@@ -1322,7 +1322,7 @@ impl ModularBlock3 {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1666,19 +1666,19 @@ impl ModularBlock3 {
         
         // Recreate buffers
         self.block1_buffer_a = Texture::create_render_target_with_format(
-            device, width, height, "Block3 B1 Buffer A", wgpu::TextureFormat::Rgba8Unorm,
+            device, width, height, "Block3 B1 Buffer A", wgpu::TextureFormat::Bgra8Unorm,
         );
         self.block1_buffer_b = Texture::create_render_target_with_format(
-            device, width, height, "Block3 B1 Buffer B", wgpu::TextureFormat::Rgba8Unorm,
+            device, width, height, "Block3 B1 Buffer B", wgpu::TextureFormat::Bgra8Unorm,
         );
         self.block1_buffer_a.clear_to_black(queue);
         self.block1_buffer_b.clear_to_black(queue);
         
         self.block2_buffer_a = Texture::create_render_target_with_format(
-            device, width, height, "Block3 B2 Buffer A", wgpu::TextureFormat::Rgba8Unorm,
+            device, width, height, "Block3 B2 Buffer A", wgpu::TextureFormat::Bgra8Unorm,
         );
         self.block2_buffer_b = Texture::create_render_target_with_format(
-            device, width, height, "Block3 B2 Buffer B", wgpu::TextureFormat::Rgba8Unorm,
+            device, width, height, "Block3 B2 Buffer B", wgpu::TextureFormat::Bgra8Unorm,
         );
         self.block2_buffer_a.clear_to_black(queue);
         self.block2_buffer_b.clear_to_black(queue);

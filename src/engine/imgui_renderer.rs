@@ -51,10 +51,13 @@ impl ImGuiRenderer {
             format: surface_format,
             width: window.inner_size().width.max(1),
             height: window.inner_size().height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            // The control window shares the same device/queue as the output window.
+            // Running both surfaces with VSync can throttle the whole app to the
+            // slowest presentation cadence, so keep the UI surface non-vsynced.
+            present_mode: wgpu::PresentMode::AutoNoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &surface_config);
         

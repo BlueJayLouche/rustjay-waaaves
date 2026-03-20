@@ -259,41 +259,77 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    /// Load configuration from file or create default
+    /// Resolve the config file path:
+    /// 1. `~/Library/Application Support/rustjay/waaaves.toml` (macOS) via `dirs::config_dir()`
+    /// 2. Falls back to `./config.toml` in the working directory
+    fn config_path() -> PathBuf {
+        if let Some(config_dir) = dirs::config_dir() {
+            let app_dir = config_dir.join("rustjay");
+            let _ = std::fs::create_dir_all(&app_dir);
+            // Migrate legacy CWD config on first run
+            let legacy = PathBuf::from("config.toml");
+            let target = app_dir.join("waaaves.toml");
+            if legacy.exists() && !target.exists() {
+                log::info!("[Config] Migrating config.toml → {}", target.display());
+                let _ = std::fs::copy(&legacy, &target);
+            }
+            target
+        } else {
+            PathBuf::from("config.toml")
+        }
+    }
+
+    /// Load configuration from the OS config directory, or return defaults.
     pub fn load_or_default() -> Self {
-        let config_path = PathBuf::from("config.toml");
-        
+        let config_path = Self::config_path();
+
         if config_path.exists() {
             match std::fs::read_to_string(&config_path) {
                 Ok(contents) => {
                     match toml::from_str(&contents) {
-                        Ok(config) => return config,
+                        Ok(config) => {
+                            log::info!("[Config] Loaded from {}", config_path.display());
+                            return config;
+                        }
                         Err(e) => {
-                            log::warn!("Failed to parse config: {}, using defaults", e);
+                            log::warn!(
+                                "[Config] Failed to parse config at {}: {}. Preserving existing file and using defaults in-memory",
+                                config_path.display(),
+                                e
+                            );
+                            return Self::default();
                         }
                     }
                 }
                 Err(e) => {
-                    log::warn!("Failed to read config: {}, using defaults", e);
+                    log::warn!(
+                        "[Config] Failed to read config at {}: {}. Preserving existing file and using defaults in-memory",
+                        config_path.display(),
+                        e
+                    );
+                    return Self::default();
                 }
             }
         }
-        
+
         let config = Self::default();
-        
-        // Save default config
+        // Save defaults so the file exists for next launch
         if let Ok(toml) = toml::to_string_pretty(&config) {
-            let _ = std::fs::write(&config_path, toml);
+            if let Err(e) = std::fs::write(&config_path, toml) {
+                log::warn!("[Config] Failed to write default config to {}: {}", config_path.display(), e);
+            }
         }
-        
         config
     }
-    
-    /// Save configuration to file
+
+    /// Atomically save configuration to the OS config directory.
     pub fn save(&self) -> anyhow::Result<()> {
-        let config_path = PathBuf::from("config.toml");
+        let config_path = Self::config_path();
         let toml = toml::to_string_pretty(self)?;
-        std::fs::write(&config_path, toml)?;
+        // Write to a temp file then rename for atomicity
+        let tmp_path = config_path.with_extension("toml.tmp");
+        std::fs::write(&tmp_path, &toml)?;
+        std::fs::rename(&tmp_path, &config_path)?;
         Ok(())
     }
 }

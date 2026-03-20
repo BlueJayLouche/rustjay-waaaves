@@ -58,9 +58,7 @@ pub fn is_ndi_available() -> bool {
 
 // Syphon input support (macOS only, requires syphon feature)
 #[cfg(all(target_os = "macos", feature = "syphon"))]
-pub use syphon_wgpu::SyphonWgpuInputFast as SyphonWgpuInput;
-#[cfg(all(target_os = "macos", feature = "syphon"))]
-pub use syphon_wgpu::InputFormat as SyphonInputFormat;
+pub use syphon_wgpu::SyphonWgpuInput;
 
 // Re-export discovery types from syphon-core for GUI use
 #[cfg(all(target_os = "macos", feature = "syphon"))]
@@ -198,6 +196,8 @@ pub struct InputManager {
     webcam_devices: Vec<WebcamDeviceInfo>,
     /// Device needs refresh
     devices_dirty: bool,
+    /// Background device discovery thread
+    discovery_thread: Option<std::thread::JoinHandle<Vec<WebcamDeviceInfo>>>,
 }
 
 /// Webcam device information
@@ -235,13 +235,11 @@ pub struct InputSource {
     #[cfg(not(feature = "ndi"))]
     ndi_receiver: Option<()>,
     /// Syphon receiver instance (GPU-accelerated wgpu integration, macOS + syphon feature only)
+    /// The received texture is owned by SyphonWgpuInput — no secondary copy needed.
     #[cfg(all(target_os = "macos", feature = "syphon"))]
     syphon_receiver: Option<SyphonWgpuInput>,
     #[cfg(not(all(target_os = "macos", feature = "syphon")))]
     syphon_receiver: Option<()>,
-    /// Last received Syphon texture (GPU-accelerated path, macOS + syphon feature only)
-    #[cfg(all(target_os = "macos", feature = "syphon"))]
-    syphon_texture: Option<wgpu::Texture>,
     /// wgpu device for GPU operations
     device: Option<Arc<wgpu::Device>>,
     /// wgpu queue for GPU operations
@@ -249,35 +247,65 @@ pub struct InputSource {
 }
 
 impl InputManager {
-    /// Create a new input manager
+    /// Create a new input manager (non-blocking — call `begin_refresh_devices()` to populate device list)
     pub fn new() -> Self {
-        // Scan for webcam devices safely (only if webcam feature enabled)
-        #[cfg(feature = "webcam")]
-        let device_strings = std::panic::catch_unwind(|| {
-            webcam::list_cameras()
-        }).unwrap_or_else(|_| {
-            log::error!("Webcam enumeration panicked");
-            Vec::new()
-        });
-        
-        #[cfg(not(feature = "webcam"))]
-        let device_strings: Vec<String> = Vec::new();
-        
-        log::info!("InputManager found {} webcam devices", device_strings.len());
-        
-        // Convert to WebcamDeviceInfo
-        let webcam_devices: Vec<WebcamDeviceInfo> = device_strings
-            .into_iter()
-            .enumerate()
-            .map(|(idx, name)| WebcamDeviceInfo { index: idx, name })
-            .collect();
-        
-        Self {
+        let mut manager = Self {
             input1: InputSource::new(InputType::None),
             input2: InputSource::new(InputType::None),
-            webcam_devices,
-            devices_dirty: false,
+            webcam_devices: Vec::new(),
+            devices_dirty: true,
+            discovery_thread: None,
+        };
+        // Kick off background discovery immediately so devices are ready soon
+        manager.begin_refresh_devices();
+        manager
+    }
+
+    /// Begin asynchronous device discovery (non-blocking).
+    /// Results are available via `poll_discovery()`.
+    pub fn begin_refresh_devices(&mut self) {
+        if self.discovery_thread.is_some() {
+            // Already scanning
+            return;
         }
+        self.discovery_thread = Some(std::thread::spawn(|| {
+            #[cfg(feature = "webcam")]
+            let device_strings = std::panic::catch_unwind(|| {
+                webcam::list_cameras()
+            }).unwrap_or_else(|_| {
+                log::error!("[InputManager] Webcam enumeration panicked");
+                Vec::new()
+            });
+
+            #[cfg(not(feature = "webcam"))]
+            let device_strings: Vec<String> = Vec::new();
+
+            device_strings
+                .into_iter()
+                .enumerate()
+                .map(|(idx, name)| WebcamDeviceInfo { index: idx, name })
+                .collect()
+        }));
+    }
+
+    /// Poll for completed device discovery.  Returns `true` if the device list was updated.
+    pub fn poll_discovery(&mut self) -> bool {
+        if let Some(handle) = &self.discovery_thread {
+            if handle.is_finished() {
+                if let Some(handle) = self.discovery_thread.take() {
+                    match handle.join() {
+                        Ok(devices) => {
+                            log::info!("[InputManager] Discovery complete: {} webcam(s)", devices.len());
+                            self.webcam_devices = devices;
+                            self.devices_dirty = false;
+                            return true;
+                        }
+                        Err(_) => log::error!("[InputManager] Discovery thread panicked"),
+                    }
+                }
+            }
+        }
+        false
     }
     
     /// Initialize inputs with wgpu device
@@ -475,8 +503,6 @@ impl InputSource {
             current_frame: None,
             ndi_receiver: None,
             syphon_receiver: None,
-            #[cfg(target_os = "macos")]
-            syphon_texture: None,
             device: None,
             queue: None,
         }
@@ -581,7 +607,6 @@ impl InputSource {
         #[cfg(all(target_os = "macos", feature = "syphon"))]
         {
             self.syphon_receiver = None;
-            self.syphon_texture = None;
         }
         
         self.frame_receiver = None;
@@ -622,31 +647,26 @@ impl InputSource {
             }
         }
         
-        // Handle Syphon frames (macOS only, requires syphon feature) - GPU-accelerated
+        // Handle Syphon frames (macOS only, requires syphon feature) - GPU zero-copy
         #[cfg(all(target_os = "macos", feature = "syphon"))]
         {
             if let Some(ref mut syphon) = self.syphon_receiver {
-                if let Some(device) = self.device.as_ref() {
-                    if let Some(queue) = self.queue.as_ref() {
-                        log::trace!("[Input] Calling syphon.receive_texture...");
-                        if let Some(texture) = syphon.receive_texture(device, queue) {
+                if let (Some(device), Some(queue)) = (self.device.as_ref(), self.queue.as_ref()) {
+                    log::trace!("[Input] Calling syphon.receive_texture...");
+                    if syphon.receive_texture(device, queue) {
+                        // Texture is owned by SyphonWgpuInput — no copy needed
+                        if let Some(texture) = syphon.output_texture() {
                             let size = texture.size();
                             log::info!("[Input] Received Syphon frame (GPU texture): {}x{}", size.width, size.height);
                             self.resolution = (size.width, size.height);
-                            // Store the texture for the engine to use
-                            self.syphon_texture = Some(texture);
                             self.texture_id = Some(1); // Non-zero indicates GPU texture is ready
-                        } else {
-                            log::trace!("[Input] No new Syphon frame available");
                         }
                     } else {
-                        log::warn!("[Input] No queue available for Syphon");
+                        log::trace!("[Input] No new Syphon frame available");
                     }
                 } else {
-                    log::warn!("[Input] No device available for Syphon");
+                    log::warn!("[Input] No device/queue for Syphon");
                 }
-            } else {
-                log::trace!("[Input] No Syphon receiver");
             }
         }
     }
@@ -671,16 +691,18 @@ impl InputSource {
         self.active
     }
     
-    /// Get Syphon texture reference (macOS only, requires syphon feature, GPU input)
+    /// Get the current Syphon output texture (owned by SyphonWgpuInput).
+    /// Zero-copy: the texture is updated in-place by the GPU blit each frame.
     #[cfg(all(target_os = "macos", feature = "syphon"))]
     pub fn get_syphon_texture(&self) -> Option<&wgpu::Texture> {
-        self.syphon_texture.as_ref()
+        self.syphon_receiver.as_ref()?.output_texture()
     }
-    
-    /// Check if this input has a GPU Syphon texture ready (macOS only, requires syphon feature)
+
+    /// Check if a GPU Syphon texture is ready (macOS only, requires syphon feature)
     #[cfg(all(target_os = "macos", feature = "syphon"))]
     pub fn has_gpu_syphon_texture(&self) -> bool {
-        self.syphon_texture.is_some()
+        self.syphon_receiver.as_ref()
+            .map_or(false, |r| r.output_texture().is_some())
     }
     
     // Stubs for when syphon feature is disabled

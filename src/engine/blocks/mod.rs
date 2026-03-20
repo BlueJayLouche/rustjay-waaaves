@@ -42,19 +42,19 @@ impl BlockResources {
         let buffer_a = Texture::create_render_target_with_format(
             device, width, height, 
             &format!("{} Buffer A", label),
-            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
         );
         
         let buffer_b = Texture::create_render_target_with_format(
             device, width, height,
             &format!("{} Buffer B", label),
-            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
         );
         
         let feedback = Texture::create_render_target_with_format(
             device, width, height,
             &format!("{} Feedback", label),
-            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
         );
         
         // Clear to black
@@ -65,7 +65,7 @@ impl BlockResources {
         let ch2_buffer = Texture::create_render_target_with_format(
             device, width, height,
             &format!("{} CH2 Buffer", label),
-            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
         );
         ch2_buffer.clear_to_black(queue);
         
@@ -76,7 +76,7 @@ impl BlockResources {
             let delay_buf = Texture::create_render_target_with_format(
                 device, width, height,
                 &format!("{} Delay {}", label, i),
-                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureFormat::Bgra8Unorm,
             );
             delay_buf.clear_to_black(queue);
             delay_buffers.push(delay_buf);
@@ -120,6 +120,18 @@ impl BlockResources {
     /// Get feedback texture view
     pub fn get_feedback_view(&self) -> &wgpu::TextureView {
         &self.feedback.view
+    }
+
+    /// Clear feedback and all internal ping-pong buffers to black.
+    /// Call this when switching inputs so stale frames don't bleed through.
+    pub fn clear_all(&self, queue: &wgpu::Queue) {
+        self.feedback.clear_to_black(queue);
+        self.buffer_a.clear_to_black(queue);
+        self.buffer_b.clear_to_black(queue);
+        self.ch2_buffer.clear_to_black(queue);
+        for buf in &self.delay_buffers {
+            buf.clear_to_black(queue);
+        }
     }
     
     /// Get output texture (not view) for copy operations

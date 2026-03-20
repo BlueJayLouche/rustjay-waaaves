@@ -4,13 +4,12 @@
 //! This module is only compiled when the `syphon` feature is enabled on macOS.
 
 #![cfg(all(target_os = "macos", feature = "syphon"))]
-//! 
+//!
 //! This module wraps the syphon-core crate's SyphonClient for integration
 //! with the input system. It provides:
 //! - Background frame polling
 //! - Frame queuing for main thread consumption
 //! - Server discovery and caching
-//! - CPU-based BGRA to RGBA conversion (GPU conversion TODO)
 //!
 //! ## Architecture
 //!
@@ -19,12 +18,11 @@
 //! - IOSurface-based frame delivery
 //! - Server directory queries
 //!
-//! ## Performance Note
+//! ## Format Note
 //!
-//! Currently uses CPU-based BGRA→RGBA conversion. For high-performance scenarios,
-//! consider using `BgraToRgbaConverter` (in `syphon_gpu_converter.rs`) which performs
-//! conversion on the GPU via compute shaders. This would require architectural changes
-//! to pass raw BGRA data to the GPU instead of converting on the CPU.
+//! Syphon delivers frames in BGRA format (native macOS IOSurface format).
+//! Frames are passed directly to the GPU as BGRA data — no CPU conversion needed.
+//! Upload to `Bgra8Unorm` textures for zero-copy path.
 
 use crossbeam::channel::{self, Sender, Receiver};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -38,7 +36,7 @@ pub use syphon_core::ServerInfo as SyphonServerInfo;
 pub struct SyphonFrame {
     pub width: u32,
     pub height: u32,
-    /// RGBA pixel data (converted from BGRA for GPU compatibility)
+    /// BGRA pixel data (native macOS IOSurface format)
     pub data: Vec<u8>,
     pub timestamp: Instant,
 }
@@ -140,13 +138,12 @@ impl SyphonInputReceiver {
                         // Convert IOSurface to CPU buffer
                         match frame.to_vec() {
                             Ok(bgra_data) => {
-                                // Convert BGRA to RGBA (Syphon uses BGRA, but wgpu/shaders expect RGBA)
-                                let rgba_data = convert_bgra_to_rgba(&bgra_data, frame.width, frame.height);
-                                
+                                // Pass BGRA data directly — native macOS IOSurface format,
+                                // matches Bgra8Unorm texture format. No CPU conversion needed.
                                 let syphon_frame = SyphonFrame {
                                     width: frame.width,
                                     height: frame.height,
-                                    data: rgba_data,
+                                    data: bgra_data,
                                     timestamp: Instant::now(),
                                 };
                                 
@@ -242,8 +239,7 @@ impl SyphonInputReceiver {
     
     /// Check if a new frame is available (approximate)
     pub fn has_frame(&self) -> bool {
-        // Check without consuming
-        self.frame_rx.try_recv().ok().map_or(false, |_| true)
+        !self.frame_rx.is_empty()
     }
     
     /// Get current resolution
@@ -404,64 +400,6 @@ impl Default for SyphonInputIntegration {
     }
 }
 
-/// Convert BGRA data to RGBA
-/// 
-/// Syphon uses BGRA format (native macOS), but wgpu/shaders expect RGBA.
-/// This function handles potential stride/padding in the IOSurface data.
-/// 
-/// Uses SIMD-friendly chunk processing for better performance.
-fn convert_bgra_to_rgba(bgra_data: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let width = width as usize;
-    let height = height as usize;
-    let pixel_count = width * height;
-    let mut rgba_data = vec![0u8; pixel_count * 4];
-    
-    // Calculate stride - IOSurface often uses aligned rows
-    let actual_stride = if height > 0 {
-        bgra_data.len() / height
-    } else {
-        width * 4
-    };
-    
-    let expected_stride = width * 4;
-    
-    // Fast path: if stride matches expected, process as contiguous blocks
-    if actual_stride == expected_stride && bgra_data.len() == pixel_count * 4 {
-        // Process 4 bytes (1 pixel) at a time using chunks_exact
-        for (src_chunk, dst_chunk) in bgra_data.chunks_exact(4).zip(rgba_data.chunks_exact_mut(4)) {
-            // BGRA -> RGBA: swap B and R
-            dst_chunk[0] = src_chunk[2]; // R <- B
-            dst_chunk[1] = src_chunk[1]; // G <- G
-            dst_chunk[2] = src_chunk[0]; // B <- R
-            dst_chunk[3] = src_chunk[3]; // A <- A
-        }
-    } else {
-        // Slow path: handle stride padding row by row
-        log::debug!("[Syphon Input] Using stride conversion: {}x{}, stride={}",
-            width, height, actual_stride);
-        
-        for y in 0..height {
-            let src_row_start = y * actual_stride;
-            let dst_row_start = y * expected_stride;
-            
-            // Process each row in chunks
-            for x in 0..width {
-                let src_idx = src_row_start + x * 4;
-                let dst_idx = dst_row_start + x * 4;
-                
-                if src_idx + 3 < bgra_data.len() {
-                    rgba_data[dst_idx] = bgra_data[src_idx + 2];
-                    rgba_data[dst_idx + 1] = bgra_data[src_idx + 1];
-                    rgba_data[dst_idx + 2] = bgra_data[src_idx];
-                    rgba_data[dst_idx + 3] = bgra_data[src_idx + 3];
-                }
-            }
-        }
-    }
-
-    rgba_data
-}
-
 // Re-export syphon_core types that input users might need
 pub use syphon_core::{SyphonClient, SyphonServerDirectory};
 
@@ -490,24 +428,4 @@ mod tests {
         assert!(integration.servers().is_empty());
     }
 
-    #[test]
-    fn test_bgra_to_rgba_conversion() {
-        // Test data: 2x1 pixel BGRA image
-        let bgra = vec![
-            255, 0, 0, 255,    // Blue (BGRA) -> Red (RGBA)
-            0, 255, 0, 255,    // Green stays green
-        ];
-        
-        let rgba = convert_bgra_to_rgba(&bgra, 2, 1);
-        
-        assert_eq!(rgba[0], 0);      // R
-        assert_eq!(rgba[1], 0);      // G
-        assert_eq!(rgba[2], 255);    // B (was R in BGRA)
-        assert_eq!(rgba[3], 255);    // A
-        
-        assert_eq!(rgba[4], 0);      // R
-        assert_eq!(rgba[5], 255);    // G
-        assert_eq!(rgba[6], 0);      // B
-        assert_eq!(rgba[7], 255);    // A
-    }
 }

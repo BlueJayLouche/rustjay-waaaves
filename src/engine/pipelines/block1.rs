@@ -1078,7 +1078,7 @@ fn fs_main(@location(0) texcoord: vec2<f32>) -> @location(0) vec4<f32> {{
             &pipeline_layout,
             &shader,
             &shader,
-            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
             "Block1 Pipeline",
         );
         
@@ -1097,7 +1097,7 @@ fn fs_main(@location(0) texcoord: vec2<f32>) -> @location(0) vec4<f32> {{
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Bgra8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });

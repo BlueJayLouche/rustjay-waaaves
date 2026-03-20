@@ -2,6 +2,42 @@
 //!
 //! Texture management for wgpu.
 
+#[derive(Clone, Copy, Debug)]
+pub struct ReadbackLayout {
+    pub row_bytes: u32,
+    pub padded_bytes_per_row: u32,
+    pub buffer_size: u64,
+}
+
+impl ReadbackLayout {
+    pub fn new(width: u32, height: u32) -> Self {
+        let row_bytes = width * 4;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = row_bytes.div_ceil(align) * align;
+        let buffer_size = (padded_bytes_per_row as u64) * (height as u64);
+
+        Self {
+            row_bytes,
+            padded_bytes_per_row,
+            buffer_size,
+        }
+    }
+}
+
+pub fn strip_readback_padding(data: &[u8], layout: ReadbackLayout, height: u32) -> Vec<u8> {
+    if layout.padded_bytes_per_row == layout.row_bytes {
+        return data.to_vec();
+    }
+
+    let mut out = Vec::with_capacity((layout.row_bytes * height) as usize);
+    for row in 0..height as usize {
+        let start = row * layout.padded_bytes_per_row as usize;
+        let end = start + layout.row_bytes as usize;
+        out.extend_from_slice(&data[start..end]);
+    }
+    out
+}
+
 /// Render target texture wrapper
 pub struct Texture {
     pub texture: wgpu::Texture,
@@ -12,14 +48,14 @@ pub struct Texture {
 }
 
 impl Texture {
-    /// Create a new render target texture (defaults to Rgba8Unorm)
+    /// Create a new render target texture (defaults to Bgra8Unorm, macOS native format)
     pub fn create_render_target(
         device: &wgpu::Device,
         width: u32,
         height: u32,
         label: &str,
     ) -> Self {
-        Self::create_render_target_with_format(device, width, height, label, wgpu::TextureFormat::Rgba8Unorm)
+        Self::create_render_target_with_format(device, width, height, label, wgpu::TextureFormat::Bgra8Unorm)
     }
     
     /// Create a new render target texture with specific format

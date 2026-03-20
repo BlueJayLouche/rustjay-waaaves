@@ -10,6 +10,7 @@
 //! - Small fixed size: 320x180 (16:9) for performance
 
 pub use crate::core::PreviewSource;
+use crate::engine::texture::{ReadbackLayout, strip_readback_padding};
 use std::sync::{mpsc::{channel, Receiver}, Arc};
 
 /// Preview renderer that copies from pipeline textures
@@ -24,6 +25,7 @@ pub struct PreviewRenderer {
     
     /// Buffer for async pixel readback
     readback_buffer: wgpu::Buffer,
+    readback_layout: ReadbackLayout,
     
     /// CPU-side pixel buffer (RGBA8)
     pixels: Vec<u8>,
@@ -78,10 +80,10 @@ impl PreviewRenderer {
         let texture_view = Arc::new(texture.create_view(&wgpu::TextureViewDescriptor::default()));
         
         // Buffer for async readback (4 bytes per pixel RGBA)
-        let buffer_size = (width * height * 4) as u64;
+        let readback_layout = ReadbackLayout::new(width, height);
         let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Preview Readback Buffer"),
-            size: buffer_size,
+            size: readback_layout.buffer_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -165,6 +167,7 @@ impl PreviewRenderer {
             texture,
             texture_view,
             readback_buffer,
+            readback_layout,
             pixels,
             map_receiver: None,
             buffer_mapped: false,
@@ -261,7 +264,7 @@ impl PreviewRenderer {
                 buffer: &self.readback_buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(self.width * 4),
+                    bytes_per_row: Some(self.readback_layout.padded_bytes_per_row),
                     rows_per_image: Some(self.height),
                 },
             },
@@ -309,7 +312,8 @@ impl PreviewRenderer {
                 // Buffer is mapped, safe to read
                 {
                     let data = self.readback_buffer.slice(..).get_mapped_range();
-                    self.pixels.copy_from_slice(&data);
+                    let pixels = strip_readback_padding(&data, self.readback_layout, self.height);
+                    self.pixels.copy_from_slice(&pixels);
                 }
                 self.readback_buffer.unmap();
                 self.buffer_mapped = false;

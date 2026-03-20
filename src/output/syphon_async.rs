@@ -12,9 +12,10 @@
 //!    GPU-to-GPU texture sharing via IOSurface.
 //! 2. **Async readback mode**: Triple-buffered GPU readback with background Syphon publishing
 //!    (fallback for compatibility).
-//!
+//! 
 //! The zero-copy mode is automatically used when a wgpu device is available.
 
+use crate::engine::texture::{ReadbackLayout, strip_readback_padding};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread::{self, JoinHandle};
 
@@ -50,6 +51,7 @@ pub struct AsyncSyphonOutput {
     /// Frame dimensions
     width: u32,
     height: u32,
+    layout: ReadbackLayout,
     /// Background poll thread
     _poll_thread: Option<JoinHandle<()>>,
     /// Shutdown signal
@@ -74,16 +76,16 @@ impl AsyncSyphonOutput {
         height: u32,
     ) -> Self {
         // Create triple-buffered readback buffers
-        let buffer_size = (width * height * 4) as u64;
+        let layout = ReadbackLayout::new(width, height);
         let mut buffers = Vec::with_capacity(3);
         
         for i in 0..3 {
-            let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("Syphon Readback Buffer {}", i)),
-                size: buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            }));
+                let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("Syphon Readback Buffer {}", i)),
+                    size: layout.buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }));
             buffers.push(TrackedBuffer {
                 buffer,
                 state: Arc::new(Mutex::new(BufferState::Free)),
@@ -110,6 +112,7 @@ impl AsyncSyphonOutput {
             _device: Arc::new(device.clone()),
             width,
             height,
+            layout,
             _poll_thread: Some(poll_thread),
             running,
         }
@@ -118,14 +121,12 @@ impl AsyncSyphonOutput {
     /// Find a free buffer for copying
     ///
     /// Returns the buffer index and reference if available.
-    pub fn acquire_buffer(&self) -> Option<(usize, &wgpu::Buffer)> {
+    pub fn acquire_buffer(&self) -> Option<(usize, Arc<wgpu::Buffer>)> {
         for (idx, tracked) in self.buffers.iter().enumerate() {
             let mut state = tracked.state.lock().unwrap();
             if *state == BufferState::Free {
                 *state = BufferState::InFlight;
-                // Return buffer reference
-                let buffer_ptr = tracked.buffer.as_ref() as *const wgpu::Buffer;
-                return Some((idx, unsafe { &*buffer_ptr }));
+                return Some((idx, Arc::clone(&tracked.buffer)));
             }
         }
         
@@ -142,6 +143,10 @@ impl AsyncSyphonOutput {
         }
         
         None
+    }
+
+    pub fn readback_layout(&self) -> ReadbackLayout {
+        self.layout
     }
     
     /// Start async processing of a buffer (call AFTER queue.submit)
@@ -194,7 +199,7 @@ impl AsyncSyphonOutput {
             if mapped {
                 // Read data
                 let data = slice.get_mapped_range();
-                let frame_data: Vec<u8> = data.to_vec();
+                let frame_data = strip_readback_padding(&data, ReadbackLayout::new(width, height), height);
                 drop(data);
                 buffer.unmap();
                 
@@ -347,6 +352,7 @@ impl SyphonOutputIntegration {
         let Some((idx, buffer)) = output.acquire_buffer() else {
             return;
         };
+        let layout = output.readback_layout();
         
         // Create encoder for copy
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -356,11 +362,11 @@ impl SyphonOutputIntegration {
         // Copy texture to buffer
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
-            wgpu::ImageCopyBuffer {
-                buffer,
-                layout: wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferInfo {
+                buffer: buffer.as_ref(),
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(self.width * 4),
+                    bytes_per_row: Some(layout.padded_bytes_per_row),
                     rows_per_image: Some(self.height),
                 },
             },

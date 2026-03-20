@@ -28,6 +28,7 @@
 //! ```
 
 use super::{IpcDiscovery, IpcError, IpcFrame, IpcInput, IpcOutput, IpcResult, IpcSourceInfo, PixelFormat};
+use crate::engine::texture::{ReadbackLayout, strip_readback_padding};
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -361,12 +362,12 @@ impl IpcOutput for V4L2Output {
         // We need to readback to CPU first
 
         let (width, height) = self.dimensions.unwrap();
-        let buffer_size = (width * height * 4) as u64;
+        let layout = ReadbackLayout::new(width, height);
 
         // Create readback buffer
         let readback_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("V4L2 Readback"),
-            size: buffer_size,
+            size: layout.buffer_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -378,11 +379,11 @@ impl IpcOutput for V4L2Output {
 
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &readback_buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(width * 4),
+                    bytes_per_row: Some(layout.padded_bytes_per_row),
                     rows_per_image: Some(height),
                 },
             },
@@ -398,12 +399,13 @@ impl IpcOutput for V4L2Output {
         // Map and read (blocking for simplicity, could be async)
         let buffer_slice = readback_buffer.slice(..);
         buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::Wait).unwrap();
+        let _ = device.poll(wgpu::PollType::Wait);
 
         let data = buffer_slice.get_mapped_range();
+        let rgba = strip_readback_padding(&data, layout, height);
 
         // Convert format and send
-        let result = self.send_buffer(&data, PixelFormat::RGBA, width, height);
+        let result = self.send_buffer(&rgba, PixelFormat::RGBA, width, height);
 
         drop(data);
         readback_buffer.unmap();

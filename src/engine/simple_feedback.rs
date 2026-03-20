@@ -158,7 +158,7 @@ fn fs_main(@location(0) texcoord: vec2<f32>) -> @location(0) vec4<f32> {
 
 impl SimpleFeedbackPipeline {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        Self::new_with_format(device, width, height, wgpu::TextureFormat::Rgba8Unorm)
+        Self::new_with_format(device, width, height, wgpu::TextureFormat::Bgra8Unorm)
     }
     
     pub fn new_with_format(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> Self {

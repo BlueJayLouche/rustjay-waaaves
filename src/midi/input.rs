@@ -242,6 +242,8 @@ pub struct MidiInputHandler {
     last_device_scan: Instant,
     /// Device scan interval
     scan_interval: std::time::Duration,
+    /// Upper bound for idle scan backoff
+    max_scan_interval: std::time::Duration,
 }
 
 impl MidiInputHandler {
@@ -256,7 +258,8 @@ impl MidiInputHandler {
             high_resolution_cc: true,
             pending_msb: HashMap::new(),
             last_device_scan: Instant::now(),
-            scan_interval: std::time::Duration::from_secs(2),
+            scan_interval: std::time::Duration::from_secs(10),
+            max_scan_interval: std::time::Duration::from_secs(60),
         })
     }
 
@@ -395,8 +398,15 @@ impl MidiInputHandler {
         
         // Check for device changes periodically
         if self.last_device_scan.elapsed() > self.scan_interval {
-            self.scan_and_connect();
+            let connected = self.scan_and_connect();
             self.last_device_scan = Instant::now();
+            if connected > 0 {
+                self.scan_interval = std::time::Duration::from_secs(10);
+            } else {
+                let next = (self.scan_interval.as_secs().max(10) * 2)
+                    .min(self.max_scan_interval.as_secs());
+                self.scan_interval = std::time::Duration::from_secs(next);
+            }
         }
         
         // Collect all pending events

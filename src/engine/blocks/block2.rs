@@ -500,7 +500,7 @@ impl ModularBlock2 {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -881,7 +881,7 @@ impl ModularBlock2 {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1492,7 +1492,7 @@ impl ModularBlock2 {
                 module: &shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Bgra8Unorm,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1950,6 +1950,12 @@ impl ModularBlock2 {
     pub fn update_params(&self, queue: &wgpu::Queue, params: &Block2Params) {
         self.update_stage1_uniforms(queue, params);
         self.update_stage3_uniforms(queue, params);
+    }
+
+    /// Clear all internal buffers (feedback + ping-pong) to black.
+    /// Call on input switch to avoid stale frames bleeding through the feedback path.
+    pub fn clear_all(&self, queue: &wgpu::Queue) {
+        self.resources.clear_all(queue);
     }
 }
 

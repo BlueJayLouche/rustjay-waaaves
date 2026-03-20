@@ -164,7 +164,14 @@ impl ApplicationHandler for SimpleApp {
             .with_title("RustJay Simple - Output")
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
         
-        let output_window = Arc::new(event_loop.create_window(output_attrs).unwrap());
+        let output_window = match event_loop.create_window(output_attrs) {
+            Ok(window) => Arc::new(window),
+            Err(err) => {
+                log::error!("[SIMPLE_APP] Failed to create output window: {}", err);
+                event_loop.exit();
+                return;
+            }
+        };
         self.output_window = Some(output_window.clone());
         
         // Create control window
@@ -172,7 +179,14 @@ impl ApplicationHandler for SimpleApp {
             .with_title("RustJay Simple - Controls")
             .with_inner_size(winit::dpi::LogicalSize::new(400, 300));
         
-        let control_window = Arc::new(event_loop.create_window(control_attrs).unwrap());
+        let control_window = match event_loop.create_window(control_attrs) {
+            Ok(window) => Arc::new(window),
+            Err(err) => {
+                log::error!("[SIMPLE_APP] Failed to create control window: {}", err);
+                event_loop.exit();
+                return;
+            }
+        };
         self.control_window = Some(control_window.clone());
         
         // Create config
@@ -188,13 +202,20 @@ impl ApplicationHandler for SimpleApp {
         // Create engine
         let shared_state = self.shared_state.clone();
         
-        let engine = pollster::block_on(async {
+        let engine = match pollster::block_on(async {
             SimpleEngine::new(output_window, shared_state, config).await
-        }).expect("Failed to create simple engine");
+        }) {
+            Ok(engine) => engine,
+            Err(err) => {
+                log::error!("[SIMPLE_APP] Failed to create simple engine: {}", err);
+                event_loop.exit();
+                return;
+            }
+        };
         
         // Create ImGui renderer for control window using shared device/queue
         let control_size = control_window.inner_size();
-        let mut imgui_renderer = pollster::block_on(async {
+        let mut imgui_renderer = match pollster::block_on(async {
             let device = engine.device();
             let queue = engine.queue();
             let instance = engine.instance();
@@ -206,7 +227,14 @@ impl ApplicationHandler for SimpleApp {
                 control_window,
                 1.0, // UI scale (default)
             ).await
-        }).expect("Failed to create ImGui renderer");
+        }) {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                log::error!("[SIMPLE_APP] Failed to create ImGui renderer: {}", err);
+                event_loop.exit();
+                return;
+            }
+        };
         
         // Set initial display size
         imgui_renderer.set_display_size(control_size.width as f32, control_size.height as f32);

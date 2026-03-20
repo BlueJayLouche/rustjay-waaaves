@@ -18,6 +18,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::engine::texture::ReadbackLayout;
+
 /// Fixed Syphon server wrapper
 /// 
 /// Uses syphon_core::SyphonServer::new() instead of new_with_name_and_device()
@@ -129,10 +131,10 @@ impl FixedSyphonWgpuOutput {
         // Copy texture to buffer, map, and send to Syphon
         // This is slow but works reliably
         
-        let buffer_size = (self.width * self.height * 4) as u64;
+        let layout = ReadbackLayout::new(self.width, self.height);
         let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Syphon Staging"),
-            size: buffer_size,
+            size: layout.buffer_size,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -152,7 +154,7 @@ impl FixedSyphonWgpuOutput {
                 buffer: &staging_buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(self.width * 4),
+                    bytes_per_row: Some(layout.padded_bytes_per_row),
                     rows_per_image: Some(self.height),
                 },
             },

@@ -29,7 +29,7 @@ pub struct NdiSourceInfo {
 pub struct NdiFrame {
     pub width: u32,
     pub height: u32,
-    pub data: Vec<u8>, // RGBA format
+    pub data: Vec<u8>, // BGRA format (native macOS IOSurface format, matches Bgra8Unorm texture)
     pub timestamp: Instant,
 }
 
@@ -176,7 +176,7 @@ impl NdiReceiver {
                 }
             };
 
-            // Create receiver with BGRA format (we'll convert to RGBA)
+            // Create receiver with BGRA format (native macOS IOSurface format)
             let options = ReceiverOptions::builder(source)
                 .color(ReceiverColorFormat::BGRX_BGRA)
                 .bandwidth(ReceiverBandwidth::Highest)
@@ -200,11 +200,11 @@ impl NdiReceiver {
                         let width = video_frame.width() as u32;
                         let height = video_frame.height() as u32;
                         
-                        // Get frame data
+                        // Get frame data — already BGRA (ReceiverColorFormat::BGRX_BGRA)
+                        // Strip any row stride/padding to produce tightly-packed BGRA bytes
+                        // matching the Bgra8Unorm texture format. No channel swap needed.
                         let frame_data = video_frame.data();
-                        
-                        // Convert BGRA to RGBA
-                        let data = convert_bgra_to_rgba(frame_data, width, height);
+                        let data = strip_stride_bgra(frame_data, width, height);
 
                         let frame = NdiFrame {
                             width,
@@ -277,43 +277,37 @@ impl Drop for NdiReceiver {
     }
 }
 
-/// Convert BGRA data to RGBA
-/// 
-/// NDI typically sends BGRA, but wgpu/shaders expect RGBA
-/// Note: NDI frame data may have row stride/padding
-fn convert_bgra_to_rgba(bgra_data: &[u8], width: u32, height: u32) -> Vec<u8> {
+/// Strip NDI row stride/padding from BGRA data.
+///
+/// NDI frames may have row-aligned padding. This produces tightly-packed BGRA
+/// bytes ready to upload to a `Bgra8Unorm` wgpu texture. No channel swap needed
+/// since BGRX_BGRA receiver color format already matches `Bgra8Unorm`.
+fn strip_stride_bgra(bgra_data: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let row_bytes = width as usize * 4;
     let pixel_count = (width * height) as usize;
-    let mut rgba_data = vec![0u8; pixel_count * 4];
-    
-    // Calculate stride - NDI often uses aligned rows
-    // The data length divided by height gives us the actual stride
+    let mut out = vec![0u8; pixel_count * 4];
+
+    // Derive actual stride from total data length
     let actual_stride = if height > 0 {
         bgra_data.len() / height as usize
     } else {
-        width as usize * 4
+        row_bytes
     };
-    
-    let expected_stride = width as usize * 4;
-    
-    log::debug!("[NDI] Converting frame: {}x{}, data_len={}, actual_stride={}, expected_stride={}",
-        width, height, bgra_data.len(), actual_stride, expected_stride);
+
+    log::debug!("[NDI] Frame: {}x{}, data_len={}, stride={}, row_bytes={}",
+        width, height, bgra_data.len(), actual_stride, row_bytes);
 
     for y in 0..height as usize {
-        for x in 0..width as usize {
-            let src_idx = y * actual_stride + x * 4;
-            let dst_idx = (y * width as usize + x) * 4;
-            
-            if src_idx + 3 < bgra_data.len() && dst_idx + 3 < rgba_data.len() {
-                // BGRA -> RGBA: swap B and R
-                rgba_data[dst_idx] = bgra_data[src_idx + 2];     // R <- B
-                rgba_data[dst_idx + 1] = bgra_data[src_idx + 1]; // G <- G
-                rgba_data[dst_idx + 2] = bgra_data[src_idx];     // B <- R
-                rgba_data[dst_idx + 3] = bgra_data[src_idx + 3]; // A <- A
-            }
+        let src_start = y * actual_stride;
+        let dst_start = y * row_bytes;
+        let src_end = src_start + row_bytes;
+        if src_end <= bgra_data.len() {
+            out[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&bgra_data[src_start..src_end]);
         }
     }
 
-    rgba_data
+    out
 }
 
 /// Global NDI availability check
@@ -334,23 +328,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_bgra_to_rgba_conversion() {
-        // Test data: 2x1 pixel BGRA image
+    fn test_strip_stride_bgra_no_padding() {
+        // Tightly-packed BGRA — should pass through unchanged
         let bgra = vec![
-            255, 0, 0, 255,    // Blue (BGRA) -> Red (RGBA)
-            0, 255, 0, 255,    // Green stays green
+            255, 0, 0, 255,    // pixel 0: B=255, G=0, R=0, A=255
+            0, 255, 0, 255,    // pixel 1: B=0,   G=255, R=0, A=255
         ];
-        
-        let rgba = convert_bgra_to_rgba(&bgra, 2, 1);
-        
-        assert_eq!(rgba[0], 0);      // R
-        assert_eq!(rgba[1], 0);      // G
-        assert_eq!(rgba[2], 255);    // B (was R in BGRA)
-        assert_eq!(rgba[3], 255);    // A
-        
-        assert_eq!(rgba[4], 0);      // R
-        assert_eq!(rgba[5], 255);    // G
-        assert_eq!(rgba[6], 0);      // B
-        assert_eq!(rgba[7], 255);    // A
+        let out = strip_stride_bgra(&bgra, 2, 1);
+        assert_eq!(&out, &bgra);
+    }
+
+    #[test]
+    fn test_strip_stride_bgra_with_padding() {
+        // 1-pixel-wide row with 4 bytes of padding per row
+        let bgra = vec![
+            10, 20, 30, 255,   // pixel 0
+            0,  0,  0,  0,     // padding
+        ];
+        let out = strip_stride_bgra(&bgra, 1, 1);
+        assert_eq!(out, vec![10, 20, 30, 255]);
     }
 }

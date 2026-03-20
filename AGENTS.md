@@ -182,6 +182,10 @@ if let Some(ref mut renderer) = self.imgui_renderer {
 - `render_frame()` takes a closure to avoid borrow issues with imgui context
 - Display size updated each frame from window size
 - Dark theme with colored section headers matches OF version
+- The control window should not repaint continuously when idle. Current behavior is:
+  - Fast redraw bursts while the user is actively interacting with the UI
+  - Slow idle refresh when nothing is happening
+  - This avoids starving the output window on the shared event loop / shared device
 
 ## Memory Layout Reference
 
@@ -243,6 +247,57 @@ let block3_pipeline = Block3Pipeline::new(&device, width, height, surface_format
 ```
 
 ## Recent Fixes
+
+### Output Window Occlusion Stall / Control Window Starvation
+
+**Problem**: The app could become sluggish or appear to freeze when:
+- The output window was hidden behind other windows
+- The control window repainted too aggressively on the shared event loop
+
+This showed up as very low effective output cadence in logs, for example `Frame 0` to `Frame 60`
+taking several seconds instead of about one second at 60 FPS.
+
+**Root Cause**:
+1. The output window render path continued to drive the swapchain even while the output window was occluded
+2. The control window shared the same device/queue and event loop, so continuous ImGui redraws could starve output rendering
+3. Multiple startup discovery tasks and device scans made the slowdown easier to trigger during initialization
+
+**Fix**:
+1. **Occlusion handling for output window**
+   - `WindowEvent::Occluded(bool)` is tracked for the output window
+   - When occluded, output redraw requests are suspended
+   - When visible again, redraw resumes immediately
+   - This avoids hitting surface acquisition / presentation while the output window is hidden
+
+2. **Event-driven control window redraw**
+   - The control window no longer repaints continuously while idle
+   - UI input marks the control window as "active" for a short burst of responsive redraws
+   - Outside that burst, the control window falls back to a slow idle refresh
+   - This keeps sliders and tabs usable without continuously stealing frame time from the output window
+
+3. **Asynchronous discovery / reduced main-thread polling**
+   - Webcam/audio/NDI/Syphon discovery was moved off the UI constructor / UI callbacks
+   - MIDI hot-plug scanning now backs off instead of retrying aggressively on the main loop
+
+**Where to look in code**:
+- `src/engine/mod.rs`
+  - Output occlusion tracking and redraw gating
+  - Control window redraw scheduling (`control_needs_redraw`, active burst, idle refresh)
+- `src/engine/imgui_renderer.rs`
+  - Control surface presentation configuration
+- `src/gui/mod.rs`
+  - Async device/source discovery for UI lists
+- `src/midi/input.rs`
+  - MIDI scan backoff
+
+**Current expected behavior**:
+- Output window hidden: app should remain responsive, and output rendering should resume when the window becomes visible
+- Control window idle: lower repaint rate
+- Control window interaction: noticeably faster repaint rate during active editing
+
+**Important tradeoff**:
+- The control window is intentionally not updated at full rate while idle
+- If the UI feels too sluggish during interaction, tune the "active burst" duration or idle refresh interval in `src/engine/mod.rs`
 
 ### Output Mode Radio Buttons Not Working
 

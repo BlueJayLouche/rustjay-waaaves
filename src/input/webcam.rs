@@ -17,7 +17,7 @@ use std::io::Cursor;
 pub struct WebcamFrame {
     pub width: u32,
     pub height: u32,
-    pub data: Vec<u8>, // RGBA data
+    pub data: Vec<u8>, // BGRA pixel data
     pub timestamp: std::time::Instant,
 }
 
@@ -388,15 +388,15 @@ fn capture_thread(
                 
                 // Detect actual format based on buffer size - the camera may return different format than reported
                 // Common camera formats: 640x480, 960x540, 1280x720, 1920x1080
-                let (rgba_data, actual_width, actual_height) = if frame_format == FrameFormat::MJPEG || 
+                let (bgra_data, actual_width, actual_height) = if frame_format == FrameFormat::MJPEG || 
                                                                   (frame_data.len() < expected_yuyv_size && frame_data.len() > 10000) {
                     // MJPEG format - needs to be decoded
                     match decode_mjpeg_to_rgba(frame_data) {
-                        Some((rgba, w, h)) => {
+                        Some((bgra, w, h)) => {
                             if frame_count <= 5 {
                                 log::info!("[WEBCAM] Decoded MJPEG frame: {}x{} from {} bytes", w, h, frame_data.len());
                             }
-                            (rgba, w, h)
+                            (bgra, w, h)
                         }
                         None => {
                             log::error!("[WEBCAM] Failed to decode MJPEG frame ({} bytes), skipping", frame_data.len());
@@ -407,7 +407,7 @@ fn capture_thread(
                     // YUYV format (2 bytes per pixel) at reported resolution
                     (convert_yuyv_to_rgba(frame_data, reported_width as usize, reported_height as usize), reported_width, reported_height)
                 } else if frame_data.len() == expected_rgba_size {
-                    // Already RGBA
+                    // Already 4 bytes/pixel — on macOS, cameras deliver BGRA natively
                     (frame_data.to_vec(), reported_width, reported_height)
                 } else if frame_data.len() == expected_rgb_size {
                     // RGB format (3 bytes per pixel)
@@ -463,7 +463,7 @@ fn capture_thread(
                 let frame = WebcamFrame {
                     width: actual_width,
                     height: actual_height,
-                    data: rgba_data,
+                    data: bgra_data,
                     timestamp: std::time::Instant::now(),
                 };
                 
@@ -496,8 +496,9 @@ fn capture_thread(
     Ok(())
 }
 
-/// Convert YUYV data to RGBA
-/// YUYV is a YUV 4:2:2 format with 2 bytes per pixel: Y0 U Y1 V
+/// Convert YUYV data to BGRA.
+/// YUYV is a YUV 4:2:2 format with 2 bytes per pixel: Y0 U Y1 V.
+/// Most webcam feeds use limited-range BT.601, so expand luma before RGB conversion.
 fn convert_yuyv_to_rgba(yuyv: &[u8], width: usize, height: usize) -> Vec<u8> {
     let expected_size = width * height * 2; // YUYV is 2 bytes per pixel
     if yuyv.len() != expected_size {
@@ -508,29 +509,29 @@ fn convert_yuyv_to_rgba(yuyv: &[u8], width: usize, height: usize) -> Vec<u8> {
     
     // Process 4 bytes (2 pixels) at a time
     for i in (0..yuyv.len().saturating_sub(3)).step_by(4) {
-        let y0 = yuyv[i] as f32;
+        let y0 = (yuyv[i] as f32 - 16.0).max(0.0);
         let u = yuyv[i + 1] as f32 - 128.0;
-        let y1 = yuyv[i + 2] as f32;
+        let y1 = (yuyv[i + 2] as f32 - 16.0).max(0.0);
         let v = yuyv[i + 3] as f32 - 128.0;
         
         // Convert first pixel (Y0, U, V)
-        let r0 = (y0 + 1.402 * v).clamp(0.0, 255.0) as u8;
-        let g0 = (y0 - 0.344136 * u - 0.714136 * v).clamp(0.0, 255.0) as u8;
-        let b0 = (y0 + 1.772 * u).clamp(0.0, 255.0) as u8;
+        let r0 = (1.164383 * y0 + 1.596027 * v).clamp(0.0, 255.0) as u8;
+        let g0 = (1.164383 * y0 - 0.391762 * u - 0.812968 * v).clamp(0.0, 255.0) as u8;
+        let b0 = (1.164383 * y0 + 2.017232 * u).clamp(0.0, 255.0) as u8;
         
-        rgba.push(r0);
-        rgba.push(g0);
         rgba.push(b0);
+        rgba.push(g0);
+        rgba.push(r0);
         rgba.push(255); // Alpha
-        
+
         // Convert second pixel (Y1, U, V)
-        let r1 = (y1 + 1.402 * v).clamp(0.0, 255.0) as u8;
-        let g1 = (y1 - 0.344136 * u - 0.714136 * v).clamp(0.0, 255.0) as u8;
-        let b1 = (y1 + 1.772 * u).clamp(0.0, 255.0) as u8;
-        
-        rgba.push(r1);
-        rgba.push(g1);
+        let r1 = (1.164383 * y1 + 1.596027 * v).clamp(0.0, 255.0) as u8;
+        let g1 = (1.164383 * y1 - 0.391762 * u - 0.812968 * v).clamp(0.0, 255.0) as u8;
+        let b1 = (1.164383 * y1 + 2.017232 * u).clamp(0.0, 255.0) as u8;
+
         rgba.push(b1);
+        rgba.push(g1);
+        rgba.push(r1);
         rgba.push(255); // Alpha
     }
     
@@ -553,9 +554,9 @@ fn convert_rgb_to_rgba(rgb: &[u8], width: usize, height: usize) -> Vec<u8> {
     
     for i in 0..pixel_count.min(rgb.len() / 3) {
         let idx = i * 3;
-        rgba.push(rgb[idx]);     // R
-        rgba.push(rgb[idx + 1]); // G
         rgba.push(rgb[idx + 2]); // B
+        rgba.push(rgb[idx + 1]); // G
+        rgba.push(rgb[idx]);     // R
         rgba.push(255);          // A (fully opaque)
     }
     
@@ -571,7 +572,11 @@ fn decode_mjpeg_to_rgba(mjpeg_data: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         Ok(dynamic_image) => {
             let rgba_image = dynamic_image.to_rgba8();
             let (width, height) = rgba_image.dimensions();
-            Some((rgba_image.into_raw(), width, height))
+            // Convert RGBA → BGRA (swap R and B) for Bgra8Unorm upload
+            let bgra_data: Vec<u8> = rgba_image.into_raw().chunks_exact(4)
+                .flat_map(|p| [p[2], p[1], p[0], p[3]])
+                .collect();
+            Some((bgra_data, width, height))
         }
         Err(e) => {
             log::debug!("[WEBCAM] MJPEG decode error: {:?}", e);

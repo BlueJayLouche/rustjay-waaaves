@@ -391,14 +391,30 @@ impl SimpleEngine {
         // Update shader params first (before any view borrows)
         self.feedback_pipeline.update_params(&self.queue, &params);
         
-        // Get texture views by extracting the actual view references
-        // Use same texture for Input 1 and Input 2 (for self-mixing test)
-        let input1_view_ref: &wgpu::TextureView = match &self.input1_texture {
-            Some(tex) => &tex.texture.view,
-            None => &self.dummy_black_texture.view,
+        // Get texture views — prefer zero-copy GPU Syphon texture when available.
+        // On macOS the SyphonWgpuInput holds the texture; we create a temporary view
+        // without any GPU copy.  For all other inputs we use the CPU-uploaded texture.
+        #[cfg(target_os = "macos")]
+        let syphon_input1_view = self.input_manager
+            .get_input1_syphon_texture()
+            .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
+
+        let input1_view_ref: &wgpu::TextureView = {
+            #[cfg(target_os = "macos")]
+            if let Some(ref v) = syphon_input1_view { v } else {
+                match &self.input1_texture {
+                    Some(tex) => &tex.texture.view,
+                    None => &self.dummy_black_texture.view,
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            match &self.input1_texture {
+                Some(tex) => &tex.texture.view,
+                None => &self.dummy_black_texture.view,
+            }
         };
-        
-        // Input 2 uses the same texture as Input 1 (both show same camera)
+
+        // Input 2 uses the same texture as Input 1 (for self-mixing / fallback)
         let input2_view_ref = input1_view_ref;
         
         let feedback_read_view_ref: &wgpu::TextureView = if self.config_settings.use_ping_pong {
@@ -544,62 +560,9 @@ impl SimpleEngine {
             }
         }
         
-        // Handle GPU Syphon texture input (macOS only)
-        #[cfg(target_os = "macos")]
-        {
-            // Check for GPU Syphon texture on input 1
-            if self.input_manager.input1_is_gpu_syphon() {
-                if let Some(syphon_texture) = self.input_manager.get_input1_syphon_texture() {
-                    let width = syphon_texture.size().width;
-                    let height = syphon_texture.size().height;
-                    
-                    // Create or resize input texture if needed
-                    let current_size = self.input1_texture.as_ref()
-                        .map(|t| (t.width, t.height));
-                    let needs_create = current_size.map(|(w, h)| w != width || h != height).unwrap_or(true);
-                    
-                    if needs_create {
-                        log::info!("[SIMPLE_ENGINE] Creating input 1 texture for Syphon: {}x{}", width, height);
-                        // Syphon-wgpu outputs Rgba8Unorm, so we need to match that format
-                        let syphon_format = wgpu::TextureFormat::Rgba8Unorm;
-                        self.input1_texture = Some(SimpleInputTexture {
-                            texture: Texture::create_render_target_with_format(
-                                &self.device, width, height, "Input 1 Syphon Texture", syphon_format,
-                            ),
-                            width,
-                            height,
-                        });
-                    }
-                    
-                    // Copy from Syphon texture to input texture
-                    if let Some(ref input_tex) = self.input1_texture {
-                        log::debug!("[SIMPLE_ENGINE] Copying Syphon texture {}x{} to input", width, height);
-                        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("Syphon Input Copy"),
-                        });
-                        
-                        encoder.copy_texture_to_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: syphon_texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::TexelCopyTextureInfo {
-                                texture: &input_tex.texture.texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                        );
-                        
-                        self.queue.submit(std::iter::once(encoder.finish()));
-                        log::debug!("[SIMPLE_ENGINE] Syphon texture copy complete");
-                    }
-                }
-            }
-        }
+        // GPU Syphon path (macOS only): the texture is already updated in-place
+        // by SyphonWgpuInput.receive_texture() during InputSource::update().
+        // No copy needed — the view is used directly in render().
     }
     
     fn get_input_view(&self) -> &wgpu::TextureView {

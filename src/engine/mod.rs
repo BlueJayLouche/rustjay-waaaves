@@ -14,7 +14,7 @@ use crate::engine::imgui_renderer::ImGuiRenderer;
 
 use crate::engine::blocks::{ModularBlock1, ModularBlock2, ModularBlock3};
 
-use crate::engine::texture::Texture;
+use crate::engine::texture::{ReadbackLayout, Texture, strip_readback_padding};
 use crate::gui::ControlGui;
 use crate::input::{InputManager, InputTextureManager};
 // NDI output is managed through AsyncNdiOutput
@@ -65,6 +65,7 @@ struct App {
     output_window: Option<Arc<Window>>,
     output_engine: Option<WgpuEngine>,
     output_fullscreen: bool,  // Track fullscreen state
+    output_occluded: bool,
     
     // Frame rate limiting for output window
     output_last_frame_time: Option<std::time::Instant>,
@@ -74,6 +75,10 @@ struct App {
     control_window: Option<Arc<Window>>,
     control_gui: Option<ControlGui>,
     imgui_renderer: Option<ImGuiRenderer>,
+    control_needs_redraw: bool,
+    control_active_until: Option<std::time::Instant>,
+    control_last_frame_time: Option<std::time::Instant>,
+    control_target_frame_duration: std::time::Duration,
     
     // Audio input
     audio_input: Option<AudioInput>,
@@ -117,6 +122,7 @@ impl App {
         let video_input: Option<InputManager> = None;
         
         let target_fps = config.output_window.fps.max(1);
+        let control_fps = config.control_window.fps.max(1);
         
         Self {
             config,
@@ -128,11 +134,18 @@ impl App {
             output_window: None,
             output_engine: None,
             output_fullscreen: false,
+            output_occluded: false,
             output_last_frame_time: None,
             output_target_frame_duration: std::time::Duration::from_secs_f32(1.0 / target_fps as f32),
             control_window: None,
             control_gui: None,
             imgui_renderer: None,
+            control_needs_redraw: true,
+            control_active_until: None,
+            control_last_frame_time: None,
+            control_target_frame_duration: std::time::Duration::from_millis(
+                ((1000.0 / control_fps as f32).max(250.0)) as u64
+            ),
             audio_input,
             video_input,
             shift_pressed: false,
@@ -511,7 +524,11 @@ impl ApplicationHandler for App {
                 ..Default::default()
             }));
         }
-        let instance = self.wgpu_instance.as_ref().unwrap();
+        let Some(instance) = self.wgpu_instance.as_ref() else {
+            log::error!("Failed to initialize wgpu instance");
+            event_loop.exit();
+            return;
+        };
         
         // Create output window first
         if self.output_window.is_none() {
@@ -524,7 +541,14 @@ impl ApplicationHandler for App {
                 .with_resizable(self.config.output_window.resizable)
                 .with_decorations(self.config.output_window.decorated);
             
-            let window = Arc::new(event_loop.create_window(window_attrs).unwrap());
+            let window = match event_loop.create_window(window_attrs) {
+                Ok(window) => Arc::new(window),
+                Err(err) => {
+                    log::error!("Failed to create output window: {}", err);
+                    event_loop.exit();
+                    return;
+                }
+            };
             
             // Hide cursor by default for output window
             window.set_cursor_visible(false);
@@ -613,7 +637,14 @@ impl ApplicationHandler for App {
                     .with_resizable(true)
                     .with_decorations(true);
                 
-                let window = Arc::new(event_loop.create_window(window_attrs).unwrap());
+                let window = match event_loop.create_window(window_attrs) {
+                    Ok(window) => Arc::new(window),
+                    Err(err) => {
+                        log::error!("Failed to create control window: {}", err);
+                        event_loop.exit();
+                        return;
+                    }
+                };
                 self.control_window = Some(Arc::clone(&window));
                 
                 // Initialize ImGui renderer using shared device/queue
@@ -674,6 +705,15 @@ impl ApplicationHandler for App {
                     WindowEvent::CloseRequested => {
                         event_loop.exit();
                     }
+                    WindowEvent::Occluded(occluded) => {
+                        self.output_occluded = occluded;
+                        if !occluded {
+                            self.output_last_frame_time = None;
+                            if let Some(ref window) = self.output_window {
+                                window.request_redraw();
+                            }
+                        }
+                    }
                     WindowEvent::CursorEntered { .. } => {
                         // Hide cursor when entering output window
                         output_window.set_cursor_visible(false);
@@ -720,8 +760,10 @@ impl ApplicationHandler for App {
                         }
                     }
                     WindowEvent::RedrawRequested => {
-                        if let Some(ref mut engine) = self.output_engine {
-                            engine.render();
+                        if !self.output_occluded {
+                            if let Some(ref mut engine) = self.output_engine {
+                                engine.render();
+                            }
                         }
                     }
                     _ => {}
@@ -733,6 +775,13 @@ impl ApplicationHandler for App {
         // Handle control window events
         if let Some(ref control_window) = self.control_window {
             if window_id == control_window.id() {
+                if !matches!(event, WindowEvent::RedrawRequested) {
+                    self.control_needs_redraw = true;
+                    self.control_active_until = Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(500)
+                    );
+                }
+
                 // Pass events to ImGui
                 if let Some(ref mut renderer) = self.imgui_renderer {
                     renderer.handle_event(&event, control_window);
@@ -769,6 +818,7 @@ impl ApplicationHandler for App {
                         if let Some(ref mut renderer) = self.imgui_renderer {
                             renderer.resize(size.width, size.height);
                         }
+                        self.control_needs_redraw = true;
                     }
                     WindowEvent::RedrawRequested => {
                         // Render imgui
@@ -791,6 +841,8 @@ impl ApplicationHandler for App {
                                 eprintln!("ImGui render error: {}", err);
                             }
                         }
+                        self.control_needs_redraw = false;
+                        self.control_last_frame_time = Some(std::time::Instant::now());
                     }
                     _ => {}
                 }
@@ -845,6 +897,13 @@ impl ApplicationHandler for App {
             match input1_request {
                 crate::core::InputChangeRequest::StartWebcam { device_index, width, height, fps, .. } => {
                     log::info!("[INPUT] Received StartWebcam request for input 1, device {}", device_index);
+                    if let Some(ref mut engine) = self.output_engine {
+                        engine.input_texture_manager.clear_input1();
+                        let queue = std::sync::Arc::clone(&engine.queue);
+                        engine.modular_block1.clear_all(&queue);
+                        engine.modular_block1.invalidate_bind_group_caches();
+                        engine.modular_block2.clear_all(&queue);
+                    }
                     if let Some(ref mut video) = self.video_input {
                         log::info!("[INPUT] Processing webcam start request for input 1, device {}", device_index);
                         match video.start_input1_webcam(device_index, width, height, fps) {
@@ -856,6 +915,13 @@ impl ApplicationHandler for App {
                     }
                 }
                 crate::core::InputChangeRequest::StartNdi { source_name, .. } => {
+                    if let Some(ref mut engine) = self.output_engine {
+                        engine.input_texture_manager.clear_input1();
+                        let queue = std::sync::Arc::clone(&engine.queue);
+                        engine.modular_block1.clear_all(&queue);
+                        engine.modular_block1.invalidate_bind_group_caches();
+                        engine.modular_block2.clear_all(&queue);
+                    }
                     if let Some(ref mut video) = self.video_input {
                         match video.start_input1_ndi(&source_name) {
                             Ok(_) => log::info!("[INPUT] Started NDI input 1: {}", source_name),
@@ -866,6 +932,13 @@ impl ApplicationHandler for App {
                     }
                 }
                 crate::core::InputChangeRequest::StartSyphon { server_name, .. } => {
+                    if let Some(ref mut engine) = self.output_engine {
+                        engine.input_texture_manager.clear_input1();
+                        let queue = std::sync::Arc::clone(&engine.queue);
+                        engine.modular_block1.clear_all(&queue);
+                        engine.modular_block1.invalidate_bind_group_caches();
+                        engine.modular_block2.clear_all(&queue);
+                    }
                     if let Some(ref mut video) = self.video_input {
                         match video.start_input1_syphon(&server_name) {
                             Ok(_) => log::info!("[INPUT] Started Syphon input 1: {}", server_name),
@@ -876,6 +949,13 @@ impl ApplicationHandler for App {
                     }
                 }
                 crate::core::InputChangeRequest::StopInput { .. } => {
+                    if let Some(ref mut engine) = self.output_engine {
+                        engine.input_texture_manager.clear_input1();
+                        let queue = std::sync::Arc::clone(&engine.queue);
+                        engine.modular_block1.clear_all(&queue);
+                        engine.modular_block1.invalidate_bind_group_caches();
+                        engine.modular_block2.clear_all(&queue);
+                    }
                     if let Some(ref mut video) = self.video_input {
                         video.stop_input1();
                     }
@@ -896,6 +976,13 @@ impl ApplicationHandler for App {
             
             match input2_request {
                 crate::core::InputChangeRequest::StartWebcam { device_index, width, height, fps, .. } => {
+                    if let Some(ref mut engine) = self.output_engine {
+                        engine.input_texture_manager.clear_input2();
+                        let queue = std::sync::Arc::clone(&engine.queue);
+                        engine.modular_block1.clear_all(&queue);
+                        engine.modular_block1.invalidate_bind_group_caches();
+                        engine.modular_block2.clear_all(&queue);
+                    }
                     if let Some(ref mut video) = self.video_input {
                         log::info!("[INPUT] Processing webcam start request for input 2, device {}", device_index);
                         match video.start_input2_webcam(device_index, width, height, fps) {
@@ -907,6 +994,13 @@ impl ApplicationHandler for App {
                     }
                 }
                 crate::core::InputChangeRequest::StartNdi { source_name, .. } => {
+                    if let Some(ref mut engine) = self.output_engine {
+                        engine.input_texture_manager.clear_input2();
+                        let queue = std::sync::Arc::clone(&engine.queue);
+                        engine.modular_block1.clear_all(&queue);
+                        engine.modular_block1.invalidate_bind_group_caches();
+                        engine.modular_block2.clear_all(&queue);
+                    }
                     if let Some(ref mut video) = self.video_input {
                         match video.start_input2_ndi(&source_name) {
                             Ok(_) => log::info!("[INPUT] Started NDI input 2: {}", source_name),
@@ -917,6 +1011,13 @@ impl ApplicationHandler for App {
                     }
                 }
                 crate::core::InputChangeRequest::StartSyphon { server_name, .. } => {
+                    if let Some(ref mut engine) = self.output_engine {
+                        engine.input_texture_manager.clear_input2();
+                        let queue = std::sync::Arc::clone(&engine.queue);
+                        engine.modular_block1.clear_all(&queue);
+                        engine.modular_block1.invalidate_bind_group_caches();
+                        engine.modular_block2.clear_all(&queue);
+                    }
                     if let Some(ref mut video) = self.video_input {
                         match video.start_input2_syphon(&server_name) {
                             Ok(_) => log::info!("[INPUT] Started Syphon input 2: {}", server_name),
@@ -927,6 +1028,13 @@ impl ApplicationHandler for App {
                     }
                 }
                 crate::core::InputChangeRequest::StopInput { .. } => {
+                    if let Some(ref mut engine) = self.output_engine {
+                        engine.input_texture_manager.clear_input2();
+                        let queue = std::sync::Arc::clone(&engine.queue);
+                        engine.modular_block1.clear_all(&queue);
+                        engine.modular_block1.invalidate_bind_group_caches();
+                        engine.modular_block2.clear_all(&queue);
+                    }
                     if let Some(ref mut video) = self.video_input {
                         video.stop_input2();
                     }
@@ -1101,25 +1209,39 @@ impl ApplicationHandler for App {
             }
         }
         
-        // Request redraw for control window (always at full rate for responsiveness)
+        // Request redraw for control window only on activity, plus a slow idle refresh
         if let Some(ref window) = self.control_window {
-            window.request_redraw();
+            let now = std::time::Instant::now();
+            let idle_due = match self.control_last_frame_time {
+                None => true,
+                Some(last_time) => {
+                    let elapsed = now.duration_since(last_time);
+                    elapsed >= self.control_target_frame_duration
+                }
+            };
+            let active = self.control_active_until.is_some_and(|until| now < until);
+            
+            if self.control_needs_redraw || active || idle_due {
+                window.request_redraw();
+            }
         }
         
         // Request redraw for output window with frame rate limiting
         if let Some(ref window) = self.output_window {
-            let now = std::time::Instant::now();
-            let should_render = match self.output_last_frame_time {
-                None => true,
-                Some(last_time) => {
-                    let elapsed = now.duration_since(last_time);
-                    elapsed >= self.output_target_frame_duration
+            if !self.output_occluded {
+                let now = std::time::Instant::now();
+                let should_render = match self.output_last_frame_time {
+                    None => true,
+                    Some(last_time) => {
+                        let elapsed = now.duration_since(last_time);
+                        elapsed >= self.output_target_frame_duration
+                    }
+                };
+                
+                if should_render {
+                    self.output_last_frame_time = Some(now);
+                    window.request_redraw();
                 }
-            };
-            
-            if should_render {
-                self.output_last_frame_time = Some(now);
-                window.request_redraw();
             }
         }
     }
@@ -1790,7 +1912,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         );
         
         // Blit the selected output to the surface using a render pass
-        // This handles format conversion (Rgba8Unorm -> Bgra8UnormSrgb)
+        // This handles format conversion (Bgra8Unorm -> Bgra8UnormSrgb) for gamma-correct display
         {
             // Create a temporary bind group for blitting
             let blit_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1939,22 +2061,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             if let Some(async_ndi) = self.ndi_async.as_ref() {
                 if should_process {
                     // Try to acquire a free buffer
-                    if let Some((idx, buffer)) = async_ndi.acquire_buffer() {
-                        encoder.copy_texture_to_buffer(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: &self.block3_texture.texture,
+                        if let Some((idx, buffer)) = async_ndi.acquire_buffer() {
+                            let layout = async_ndi.readback_layout();
+                            encoder.copy_texture_to_buffer(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: &self.block3_texture.texture,
                                 mip_level: 0,
                                 origin: wgpu::Origin3d::ZERO,
                                 aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::TexelCopyBufferInfo {
-                                buffer,
-                                layout: wgpu::TexelCopyBufferLayout {
-                                    offset: 0,
-                                    bytes_per_row: Some(ndi_width * 4),
-                                    rows_per_image: Some(ndi_height),
                                 },
-                            },
+                                wgpu::TexelCopyBufferInfo {
+                                    buffer: buffer.as_ref(),
+                                    layout: wgpu::TexelCopyBufferLayout {
+                                        offset: 0,
+                                        bytes_per_row: Some(layout.padded_bytes_per_row),
+                                        rows_per_image: Some(ndi_height),
+                                    },
+                                },
                             wgpu::Extent3d {
                                 width: ndi_width,
                                 height: ndi_height,
@@ -2095,12 +2218,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 return;
             }
             
-            let frame_size = (width * height * 4) as usize;
-            
-            let buffer_size = (width * height * 4) as u64; // RGBA = 4 bytes per pixel
+            let layout = ReadbackLayout::new(width, height);
             let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Recording Staging Buffer"),
-                size: buffer_size,
+                size: layout.buffer_size,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             });
@@ -2119,7 +2240,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     buffer: &staging_buffer,
                     layout: wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(width * 4),
+                        bytes_per_row: Some(layout.padded_bytes_per_row),
                         rows_per_image: Some(height),
                     },
                 },
@@ -2145,9 +2266,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 if let Ok(Ok(())) = rx.recv() {
                     // Read data and send to recorder
                     let data = buffer_slice.get_mapped_range();
-                    let rgba_data: &[u8] = &data;
+                    let rgba_data = strip_readback_padding(&data, layout, height);
                     if let Some(ref mut recorder) = self.recorder {
-                        if let Err(e) = recorder.write_frame(rgba_data) {
+                        if let Err(e) = recorder.write_frame(&rgba_data) {
                             log::error!("Failed to write frame to recorder: {}", e);
                             // Stop recording on error
                             drop(self.recorder.take());
@@ -2446,4 +2567,3 @@ fn apply_audio_modulations_to_block3(
         }
     }
 }
-

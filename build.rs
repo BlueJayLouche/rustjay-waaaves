@@ -86,10 +86,21 @@ fn link_local_syphon_framework() {
     // Note: cargo-bundle will handle embedding this for distribution
     println!("cargo:rustc-link-lib=framework=Syphon");
     
-    // Also add NDI library path if available
-    // NDI is typically installed in /usr/local/lib/
-    if std::path::Path::new("/usr/local/lib/libndi.dylib").exists() {
-        println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/local/lib");
-        println!("cargo:warning=   Added NDI rpath: /usr/local/lib");
+    // Add NDI library rpath — check both known install locations
+    let ndi_lib_paths = [
+        "/usr/local/lib",
+        "/Library/NDI SDK for Apple/lib/macOS",
+    ];
+    for path in &ndi_lib_paths {
+        if std::path::Path::new(path).join("libndi.dylib").exists() {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path);
+            println!("cargo:warning=   Added NDI rpath: {}", path);
+        }
     }
+
+    // Standard relative rpaths for cargo run and app bundles
+    println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/../Frameworks");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
 }

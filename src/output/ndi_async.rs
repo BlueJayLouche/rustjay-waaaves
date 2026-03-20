@@ -12,6 +12,7 @@
 //! - Callback thread pool: When map completes, read data, send to NDI, unmap, mark free
 //! - No waiting - each buffer flows through independently
 
+use crate::engine::texture::{ReadbackLayout, strip_readback_padding};
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread::{self, JoinHandle};
 
@@ -43,6 +44,7 @@ pub struct AsyncNdiOutput {
     /// Frame dimensions
     width: u32,
     height: u32,
+    layout: ReadbackLayout,
     /// Background thread handle for polling
     _poll_thread: Option<JoinHandle<()>>,
     /// Shutdown signal
@@ -58,16 +60,16 @@ impl AsyncNdiOutput {
         height: u32,
     ) -> Self {
         // Create triple-buffered readback buffers
-        let buffer_size = (width * height * 4) as u64;
+        let layout = ReadbackLayout::new(width, height);
         let mut buffers = Vec::with_capacity(3);
         
         for i in 0..3 {
-            let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("NDI Readback Buffer {}", i)),
-                size: buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            }));
+                let buffer = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(&format!("NDI Readback Buffer {}", i)),
+                    size: layout.buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }));
             buffers.push(TrackedBuffer {
                 buffer,
                 state: Arc::new(Mutex::new(BufferState::Free)),
@@ -81,7 +83,7 @@ impl AsyncNdiOutput {
         let running_poll = Arc::clone(&running);
         let poll_thread = thread::spawn(move || {
             while running_poll.load(Ordering::Relaxed) {
-                device_arc.poll(wgpu::PollType::Poll);
+                let _ = device_arc.poll(wgpu::PollType::Poll);
                 thread::sleep(std::time::Duration::from_micros(100));
             }
         });
@@ -92,20 +94,19 @@ impl AsyncNdiOutput {
             _device: Arc::new(device.clone()),
             width,
             height,
+            layout,
             _poll_thread: Some(poll_thread),
             running,
         }
     }
     
     /// Find a free buffer for copying
-    pub fn acquire_buffer(&self) -> Option<(usize, &wgpu::Buffer)> {
+    pub fn acquire_buffer(&self) -> Option<(usize, Arc<wgpu::Buffer>)> {
         for (idx, tracked) in self.buffers.iter().enumerate() {
             let mut state = tracked.state.lock().unwrap();
             if *state == BufferState::Free {
                 *state = BufferState::InFlight;
-                // Return the buffer reference
-                let buffer_ptr = tracked.buffer.as_ref() as *const wgpu::Buffer;
-                return Some((idx, unsafe { &*buffer_ptr }));
+                return Some((idx, Arc::clone(&tracked.buffer)));
             }
         }
         // All buffers in flight - log this occasionally
@@ -120,6 +121,10 @@ impl AsyncNdiOutput {
             log::warn!("[NDI] All buffers in flight - frame dropped");
         }
         None
+    }
+
+    pub fn readback_layout(&self) -> ReadbackLayout {
+        self.layout
     }
     
     /// Start async processing of a buffer (call AFTER queue.submit)
@@ -172,8 +177,7 @@ impl AsyncNdiOutput {
             if mapped {
                 // Read data efficiently
                 let data = slice.get_mapped_range();
-                // Direct slice copy instead of iterator
-                let frame_data: Vec<u8> = data.to_vec();
+                let frame_data = strip_readback_padding(&data, ReadbackLayout::new(width, height), height);
                 drop(data);
                 buffer.unmap();
                 
