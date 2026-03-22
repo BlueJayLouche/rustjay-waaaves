@@ -5102,8 +5102,10 @@ impl ControlGui {
     
     /// Build Settings panel
     fn build_settings_panel(&mut self, ui: &Ui) {
-        // Performance stats at the top
-        ui.text(format!("FPS: {:.1}", self.main_fps));
+        // Performance stats at the top — show actual output window FPS from engine
+        let output_fps = self.shared_state.lock().map(|s| s.output_actual_fps).unwrap_or(0.0);
+        ui.text(format!("Output FPS: {:.1}", output_fps));
+        ui.text(format!("GUI FPS: {:.1}", self.main_fps));
         ui.separator();
         
         // Output mode selection
@@ -5381,7 +5383,7 @@ impl ControlGui {
             if is_active {
                 if ui.button("Stop NDI Output") {
                     if let Ok(mut state) = self.shared_state.lock() {
-                        state.ndi_output_command = crate::core::NdiOutputCommand::Stop;
+                        state.output_command = crate::core::OutputCommand::StopNdi;
                     }
                 }
             } else {
@@ -5390,8 +5392,8 @@ impl ControlGui {
                     let alpha = self.config.ndi.output_alpha;
                     let skip = self.config.ndi.frame_skip.max(1);
                     if let Ok(mut state) = self.shared_state.lock() {
-                        state.ndi_output_command = crate::core::NdiOutputCommand::Start { 
-                            name, 
+                        state.output_command = crate::core::OutputCommand::StartNdi {
+                            name,
                             include_alpha: alpha,
                             frame_skip: skip,
                         };
@@ -5449,14 +5451,14 @@ impl ControlGui {
                 if is_active {
                     if ui.button("Stop Syphon Output") {
                         if let Ok(mut state) = self.shared_state.lock() {
-                            state.syphon_output_command = crate::core::SyphonOutputCommand::Stop;
+                            state.output_command = crate::core::OutputCommand::StopSyphon;
                         }
                     }
                 } else {
                     if ui.button("Start Syphon Output") {
                         let name = self.config.syphon.server_name.clone();
                         if let Ok(mut state) = self.shared_state.lock() {
-                            state.syphon_output_command = crate::core::SyphonOutputCommand::Start { name };
+                            state.output_command = crate::core::OutputCommand::StartSyphon { name };
                         }
                     }
                 }

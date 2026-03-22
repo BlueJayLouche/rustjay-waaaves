@@ -1755,10 +1755,13 @@ impl ModularBlock2 {
         // Update uniforms
         self.update_stage3_uniforms(queue, params);
         
-        // Get feedback views based on delay setting
+        // Lazily allocate delay buffers when delay is active
+        let delay_frames = params.fb2_delay_time as usize;
+        if delay_frames > 0 {
+            self.resources.ensure_delay_capacity(device, queue, delay_frames, "Block2");
+        }
         // When delay_time > 0, both textures use the delayed frame (shader only uses delay_tex)
         // When delay_time == 0, fb2_tex uses immediate feedback, delay_tex is unused
-        let delay_frames = params.fb2_delay_time as usize;
         let (fb2_view, delay_view) = if delay_frames > 0 {
             let delayed = self.resources.get_delay_view(delay_frames);
             (delayed, delayed)

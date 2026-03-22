@@ -69,18 +69,10 @@ impl BlockResources {
         );
         ch2_buffer.clear_to_black(queue);
         
-        // Create delay buffer ring (default 120 frames = 2 seconds at 60fps)
+        // Delay buffers are allocated lazily — start empty, grow on demand
+        // up to max_delay_frames (120 = 2 seconds at 60fps).
         let max_delay_frames = 120;
-        let mut delay_buffers = Vec::with_capacity(max_delay_frames);
-        for i in 0..max_delay_frames {
-            let delay_buf = Texture::create_render_target_with_format(
-                device, width, height,
-                &format!("{} Delay {}", label, i),
-                wgpu::TextureFormat::Bgra8Unorm,
-            );
-            delay_buf.clear_to_black(queue);
-            delay_buffers.push(delay_buf);
-        }
+        let delay_buffers = Vec::new();
         
         Self {
             buffer_a,
@@ -200,27 +192,56 @@ impl BlockResources {
         );
     }
     
-    /// Get delay buffer view for reading (based on delay_time frames ago)
+    /// Lazily grow the delay ring buffer up to `needed_frames` (capped at max_delay_frames).
+    pub fn ensure_delay_capacity(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, needed_frames: usize, label: &str) {
+        let target = needed_frames.min(self.max_delay_frames);
+        if self.delay_buffers.len() >= target {
+            return;
+        }
+        let w = self.buffer_a.width;
+        let h = self.buffer_a.height;
+        for i in self.delay_buffers.len()..target {
+            let tex = Texture::create_render_target_with_format(
+                device, w, h,
+                &format!("{} Delay {}", label, i),
+                wgpu::TextureFormat::Bgra8Unorm,
+            );
+            tex.clear_to_black(queue);
+            self.delay_buffers.push(tex);
+        }
+        log::info!("Delay buffers for {} grew to {} frames", label, self.delay_buffers.len());
+    }
+
+    /// Get delay buffer view for reading (based on delay_time frames ago).
+    /// Returns feedback view as fallback when no delay buffers are allocated.
     pub fn get_delay_view(&self, delay_time: usize) -> &wgpu::TextureView {
-        let delay_frames = delay_time.min(self.max_delay_frames).max(1);
-        // Read from (write_index - delay_frames) positions ago
+        if self.delay_buffers.is_empty() {
+            return &self.feedback.view;
+        }
+        let len = self.delay_buffers.len();
+        let delay_frames = delay_time.min(len).max(1);
         let read_index = if self.delay_write_index >= delay_frames {
             self.delay_write_index - delay_frames
         } else {
-            self.max_delay_frames - (delay_frames - self.delay_write_index)
+            len - (delay_frames - self.delay_write_index)
         };
-        &self.delay_buffers[read_index].view
+        &self.delay_buffers[read_index % len].view
     }
     
-    /// Update delay buffer ring with current output and advance write index
+    /// Update delay buffer ring with current output and advance write index.
+    /// No-op when delay buffers haven't been allocated yet.
     pub fn update_delay_buffer(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.delay_buffers.is_empty() {
+            return;
+        }
+        let len = self.delay_buffers.len();
+        let write_idx = self.delay_write_index % len;
         let output_tex = if self.current_output == 0 {
             &self.buffer_a.texture
         } else {
             &self.buffer_b.texture
         };
-        let current_delay_buf = &self.delay_buffers[self.delay_write_index];
-        
+
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: output_tex,
@@ -229,7 +250,7 @@ impl BlockResources {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyTextureInfo {
-                texture: &current_delay_buf.texture,
+                texture: &self.delay_buffers[write_idx].texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -240,15 +261,19 @@ impl BlockResources {
                 depth_or_array_layers: 1,
             },
         );
-        
-        // Advance write index
-        self.delay_write_index = (self.delay_write_index + 1) % self.max_delay_frames;
+
+        self.delay_write_index = (write_idx + 1) % len;
     }
     
-    /// Update delay buffer from an external texture
+    /// Update delay buffer from an external texture.
+    /// No-op when delay buffers haven't been allocated yet.
     pub fn update_delay_buffer_from_external(&mut self, encoder: &mut wgpu::CommandEncoder, source_texture: &wgpu::Texture) {
-        let current_delay_buf = &self.delay_buffers[self.delay_write_index];
-        
+        if self.delay_buffers.is_empty() {
+            return;
+        }
+        let len = self.delay_buffers.len();
+        let write_idx = self.delay_write_index % len;
+
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: source_texture,
@@ -257,7 +282,7 @@ impl BlockResources {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyTextureInfo {
-                texture: &current_delay_buf.texture,
+                texture: &self.delay_buffers[write_idx].texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -268,9 +293,8 @@ impl BlockResources {
                 depth_or_array_layers: 1,
             },
         );
-        
-        // Advance write index
-        self.delay_write_index = (self.delay_write_index + 1) % self.max_delay_frames;
+
+        self.delay_write_index = (write_idx + 1) % len;
     }
 }
 

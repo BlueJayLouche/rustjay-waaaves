@@ -180,31 +180,28 @@ impl NdiOutputSender {
         
     }
     
-    /// Submit a frame for sending
-    /// 
-    /// The data should be in RGBA format. It will be converted to BGRA/BGRX internally.
+    /// Submit a frame for sending.
+    ///
+    /// The data must be in BGRA format (native GPU readback format).
     /// If the channel is full, the oldest frame will be dropped.
-    pub fn submit_frame(&self, rgba_data: &[u8], width: u32, height: u32) {
+    pub fn submit_frame(&self, bgra_data: &[u8], width: u32, height: u32) {
         // Validate dimensions match
         if width != self.width || height != self.height {
             log::warn!("[NDI OUTPUT] Frame size mismatch: expected {}x{}, got {}x{}",
                 self.width, self.height, width, height);
             return;
         }
-        
+
         // Validate data is not empty
-        if rgba_data.is_empty() {
+        if bgra_data.is_empty() {
             log::warn!("[NDI OUTPUT] Empty frame data received");
             return;
         }
-        
-        // Convert RGBA to BGRA/BGRX
-        let bgra_data = convert_rgba_to_bgra(rgba_data, width, height, self.include_alpha);
-        
+
         let frame = FrameData {
             width,
             height,
-            data: bgra_data,
+            data: bgra_data.to_vec(),
             has_alpha: self.include_alpha,
             timestamp: Instant::now(),
         };
@@ -268,84 +265,7 @@ impl Drop for NdiOutputSender {
     }
 }
 
-/// Convert RGBA data to BGRA/BGRX
-/// 
-/// wgpu typically uses BGRA on macOS, so this might be a simple copy in some cases.
-/// But we always do the conversion to be safe.
-fn convert_rgba_to_bgra(rgba_data: &[u8], width: u32, height: u32, include_alpha: bool) -> Vec<u8> {
-    let pixel_count = (width * height) as usize;
-    let mut bgra_data = vec![0u8; pixel_count * 4];
-    
-    // Check if data size matches
-    let expected_size = pixel_count * 4;
-    if rgba_data.len() != expected_size {
-        log::warn!("[NDI OUTPUT] RGBA data size mismatch: got {}, expected {}", 
-            rgba_data.len(), expected_size);
-        // Use minimum of both sizes
-        let safe_pixels = (rgba_data.len() / 4).min(pixel_count);
-        for i in 0..safe_pixels {
-            let src_idx = i * 4;
-            let dst_idx = i * 4;
-            bgra_data[dst_idx] = rgba_data[src_idx + 2];     // B <- R
-            bgra_data[dst_idx + 1] = rgba_data[src_idx + 1]; // G <- G
-            bgra_data[dst_idx + 2] = rgba_data[src_idx];     // R <- B
-            bgra_data[dst_idx + 3] = if include_alpha { rgba_data[src_idx + 3] } else { 0xFF }; // A
-        }
-    } else {
-        // Fast path: sizes match
-        for i in 0..pixel_count {
-            let src_idx = i * 4;
-            let dst_idx = i * 4;
-            bgra_data[dst_idx] = rgba_data[src_idx + 2];     // B <- R
-            bgra_data[dst_idx + 1] = rgba_data[src_idx + 1]; // G <- G
-            bgra_data[dst_idx + 2] = rgba_data[src_idx];     // R <- B
-            bgra_data[dst_idx + 3] = if include_alpha { rgba_data[src_idx + 3] } else { 0xFF }; // A
-        }
-    }
-    
-    bgra_data
-}
-
 /// Check if NDI output is available
 pub fn is_ndi_output_available() -> bool {
     NDI::new().is_ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_rgba_to_bgra_conversion() {
-        // Test data: 2x1 pixel RGBA image
-        let rgba = vec![
-            255, 0, 0, 255,    // Red (RGBA) -> Blue (BGRA)
-            0, 255, 0, 255,    // Green stays green
-        ];
-        
-        let bgra = convert_rgba_to_bgra(&rgba, 2, 1, true);
-        
-        assert_eq!(bgra[0], 0);      // B
-        assert_eq!(bgra[1], 0);      // G
-        assert_eq!(bgra[2], 255);    // R (was B in RGBA)
-        assert_eq!(bgra[3], 255);    // A
-        
-        assert_eq!(bgra[4], 0);      // B
-        assert_eq!(bgra[5], 255);    // G
-        assert_eq!(bgra[6], 0);      // R
-        assert_eq!(bgra[7], 255);    // A
-    }
-    
-    #[test]
-    fn test_rgba_to_bgrx_conversion() {
-        // Test data: 1x1 pixel RGBA image
-        let rgba = vec![255, 0, 0, 128]; // Red with 50% alpha
-        
-        let bgrx = convert_rgba_to_bgra(&rgba, 1, 1, false);
-        
-        assert_eq!(bgrx[0], 0);      // B
-        assert_eq!(bgrx[1], 0);      // G
-        assert_eq!(bgrx[2], 255);    // R
-        assert_eq!(bgrx[3], 0xFF);   // X (forced to 255)
-    }
 }

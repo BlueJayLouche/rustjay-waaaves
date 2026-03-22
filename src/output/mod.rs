@@ -1,12 +1,13 @@
 //! # Output Module
 //!
-//! Handles video output to external systems including:
-//! - NDI output
-//! - Syphon output (macOS)
-//! - Spout output (Windows)
-//! - Video recording (via FFmpeg)
+//! Handles video output to external systems:
+//! - NDI output (cross-platform, CPU readback path)
+//! - Syphon output (macOS, zero-copy GPU path)
+//!
+//! GPU readback uses a double-buffered staging pool so the render thread
+//! never blocks waiting for a GPU→CPU copy to complete.
 
-use crate::engine::texture::{ReadbackLayout, strip_readback_padding};
+pub mod readback;
 
 // NDI output (requires ndi feature)
 #[cfg(feature = "ndi")]
@@ -14,67 +15,60 @@ pub mod ndi_sender;
 #[cfg(feature = "ndi")]
 pub use ndi_sender::{NdiOutputSender, is_ndi_output_available};
 
-#[cfg(feature = "ndi")]
-pub mod ndi_async;
-#[cfg(feature = "ndi")]
-pub use ndi_async::AsyncNdiOutput;
-
-// Platform-specific IPC outputs (macOS only, requires syphon feature)
+// Syphon output (macOS only, requires syphon feature)
 #[cfg(all(target_os = "macos", feature = "syphon"))]
 pub mod syphon_sender;
 #[cfg(all(target_os = "macos", feature = "syphon"))]
 pub use syphon_sender::{SyphonSender, SyphonWgpuSender};
 
+// Legacy modules kept for compatibility but no longer used by OutputManager
 #[cfg(all(target_os = "macos", feature = "syphon"))]
 pub mod syphon_async;
 #[cfg(all(target_os = "macos", feature = "syphon"))]
 pub use syphon_async::{AsyncSyphonOutput, SyphonOutputIntegration};
 
-/// Consolidated output manager for live outputs.
-///
-/// Holds optional NDI and Syphon outputs and dispatches `submit_frame()`
-/// to whichever are currently active.
+use readback::ReadbackPool;
+
+// ---------------------------------------------------------------------------
+// OutputManager
+// ---------------------------------------------------------------------------
+
+/// Manages all video outputs with async readback for CPU-path sinks.
 pub struct OutputManager {
-    #[cfg(all(target_os = "macos", feature = "syphon"))]
-    syphon: SyphonOutputIntegration,
+    /// NDI network output
     #[cfg(feature = "ndi")]
     ndi: Option<NdiOutputSender>,
+
+    /// Syphon zero-copy GPU output (macOS)
+    #[cfg(all(target_os = "macos", feature = "syphon"))]
+    syphon: Option<SyphonWgpuSender>,
+
+    /// Async readback pool for CPU-path outputs (NDI).
+    readback_pool: ReadbackPool,
+
+    /// Frame skip factor for NDI (0 = every frame, 1 = every 2nd, etc.)
+    #[cfg(feature = "ndi")]
+    frame_skip: u8,
+    #[cfg(feature = "ndi")]
+    skip_counter: u8,
 }
 
 impl OutputManager {
     pub fn new() -> Self {
         Self {
-            #[cfg(all(target_os = "macos", feature = "syphon"))]
-            syphon: SyphonOutputIntegration::new(),
             #[cfg(feature = "ndi")]
             ndi: None,
+            #[cfg(all(target_os = "macos", feature = "syphon"))]
+            syphon: None,
+            readback_pool: ReadbackPool::new(),
+            #[cfg(feature = "ndi")]
+            frame_skip: 1,
+            #[cfg(feature = "ndi")]
+            skip_counter: 0,
         }
     }
 
-    /// Start (or restart) Syphon output.
-    #[cfg(all(target_os = "macos", feature = "syphon"))]
-    pub fn start_syphon(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        name: &str,
-        width: u32,
-        height: u32,
-    ) -> anyhow::Result<()> {
-        self.syphon.enable(device, queue, name, width, height)
-    }
-
-    /// Stop Syphon output.
-    #[cfg(all(target_os = "macos", feature = "syphon"))]
-    pub fn stop_syphon(&mut self) {
-        self.syphon.disable();
-    }
-
-    /// Whether Syphon output is currently active.
-    #[cfg(all(target_os = "macos", feature = "syphon"))]
-    pub fn syphon_active(&self) -> bool {
-        self.syphon.is_enabled()
-    }
+    // ── NDI ───────────────────────────────────────────────────────────
 
     /// Start (or restart) NDI output.
     #[cfg(feature = "ndi")]
@@ -84,16 +78,26 @@ impl OutputManager {
         width: u32,
         height: u32,
         include_alpha: bool,
+        frame_skip: u8,
     ) -> anyhow::Result<()> {
+        self.stop_ndi();
         let sender = NdiOutputSender::new(name, width, height, include_alpha)?;
         self.ndi = Some(sender);
+        self.frame_skip = frame_skip.max(1);
+        self.skip_counter = 0;
+        log::info!("NDI output started: {} ({}x{}, alpha={}, skip={})",
+            name, width, height, include_alpha, self.frame_skip);
         Ok(())
     }
 
     /// Stop NDI output.
     #[cfg(feature = "ndi")]
     pub fn stop_ndi(&mut self) {
-        self.ndi = None;
+        if self.ndi.take().is_some() {
+            self.frame_skip = 1;
+            self.skip_counter = 0;
+            log::info!("NDI output stopped");
+        }
     }
 
     /// Whether NDI output is currently active.
@@ -102,87 +106,124 @@ impl OutputManager {
         self.ndi.is_some()
     }
 
-    /// Submit a frame to all active outputs.
+    // ── Syphon ────────────────────────────────────────────────────────
+
+    /// Start (or restart) Syphon output.
+    #[cfg(all(target_os = "macos", feature = "syphon"))]
+    pub fn start_syphon(
+        &mut self,
+        name: &str,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        self.stop_syphon();
+        let sender = SyphonWgpuSender::new(name, device, queue, width, height)?;
+        self.syphon = Some(sender);
+        log::info!("Syphon output started: {}", name);
+        Ok(())
+    }
+
+    /// Stop Syphon output.
+    #[cfg(all(target_os = "macos", feature = "syphon"))]
+    pub fn stop_syphon(&mut self) {
+        if self.syphon.take().is_some() {
+            log::info!("Syphon output stopped");
+        }
+    }
+
+    /// Whether Syphon output is currently active.
+    #[cfg(all(target_os = "macos", feature = "syphon"))]
+    pub fn syphon_active(&self) -> bool {
+        self.syphon.is_some()
+    }
+
+    #[cfg(all(target_os = "macos", feature = "syphon"))]
+    pub fn syphon_is_zero_copy(&self) -> bool {
+        self.syphon.as_ref().map_or(false, |s| s.is_zero_copy())
+    }
+
+    // ── Frame submission ──────────────────────────────────────────────
+
+    /// Returns true if any CPU-path output needs readback.
+    fn needs_readback(&self) -> bool {
+        #[cfg(feature = "ndi")]
+        if self.ndi.is_some() {
+            return true;
+        }
+        false
+    }
+
+    /// Submit frame to all active outputs.
     ///
-    /// `texture` must be in `Bgra8Unorm` format (the pipeline native format).
+    /// GPU-path outputs (Syphon) receive the texture directly.
+    /// CPU-path outputs (NDI) use the async readback pool — the
+    /// render thread never blocks waiting for a GPU→CPU copy.
     pub fn submit_frame(
         &mut self,
         texture: &wgpu::Texture,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
+        // CPU-path outputs: harvest previous frame's readback, then
+        // submit a new copy for this frame.
+        if self.needs_readback() {
+            // Non-blocking poll to nudge the GPU.
+            device.poll(wgpu::PollType::Poll).ok();
+
+            // Harvest the previous frame (never blocks).
+            if let Some((data, width, height)) = self.readback_pool.harvest_previous() {
+                #[cfg(feature = "ndi")]
+                if let Some(ref ndi) = self.ndi {
+                    ndi.submit_frame(&data, width, height);
+                }
+            }
+
+            // Apply frame skip then submit a new copy.
+            #[cfg(feature = "ndi")]
+            {
+                self.skip_counter = self.skip_counter.wrapping_add(1);
+                if self.skip_counter % (self.frame_skip + 1) == 0 {
+                    self.readback_pool.submit_copy(texture, device, queue);
+                    self.skip_counter = 0;
+                }
+            }
+            #[cfg(not(feature = "ndi"))]
+            {
+                self.readback_pool.submit_copy(texture, device, queue);
+            }
+        }
+
+        // Syphon: zero-copy GPU path
         #[cfg(all(target_os = "macos", feature = "syphon"))]
-        self.syphon.submit_frame(texture, device, queue);
+        if let Some(ref mut syphon) = self.syphon {
+            syphon.publish(texture, device, queue);
+        }
+    }
 
-        // NDI currently requires CPU-side pixel data, so this path performs
-        // a synchronous readback and channel swap before enqueueing the frame.
+    /// Shutdown all outputs.
+    pub fn shutdown(&mut self) {
         #[cfg(feature = "ndi")]
-        if let Some(ref ndi) = self.ndi {
-            let size = texture.size();
-            let bgra = Self::read_texture_bgra(device, queue, texture, size.width, size.height);
-            let rgba = Self::bgra_to_rgba(&bgra);
-            ndi.submit_frame(&rgba, size.width, size.height);
-        }
+        self.stop_ndi();
+        #[cfg(all(target_os = "macos", feature = "syphon"))]
+        self.stop_syphon();
     }
 
-    /// Read a texture's pixel data as BGRA bytes (for CPU-side outputs like NDI).
-    ///
-    /// This is a synchronous readback — use sparingly (not every frame at 60fps).
-    pub fn read_texture_bgra(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        texture: &wgpu::Texture,
-        width: u32,
-        height: u32,
-    ) -> Vec<u8> {
-        let layout = ReadbackLayout::new(width, height);
-
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("OutputManager Readback"),
-            size: layout.buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("OutputManager Readback Encoder"),
-        });
-        encoder.copy_texture_to_buffer(
-            texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(layout.padded_bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-        );
-        queue.submit(std::iter::once(encoder.finish()));
-
-        let slice = readback.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        device.poll(wgpu::PollType::Wait).expect("device poll failed");
-        let _ = rx.recv();
-
-        let data = slice.get_mapped_range();
-        strip_readback_padding(&data, layout, height)
-    }
-
-    #[cfg(feature = "ndi")]
-    fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
-        let mut rgba = Vec::with_capacity(bgra.len());
-        for pixel in bgra.chunks_exact(4) {
-            rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-        }
-        rgba
+    /// Drain readback pool (call when GPU device is still alive).
+    pub fn drain_readback(&mut self, device: &wgpu::Device) {
+        self.readback_pool.drain(device);
     }
 }
 
 impl Default for OutputManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for OutputManager {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

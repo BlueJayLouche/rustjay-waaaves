@@ -70,6 +70,8 @@ struct App {
     // Frame rate limiting for output window
     output_last_frame_time: Option<std::time::Instant>,
     output_target_frame_duration: std::time::Duration,
+    output_next_frame_time: std::time::Instant,
+    output_vsync_enabled: bool,
     
     // Control window (imgui)
     control_window: Option<Arc<Window>>,
@@ -123,6 +125,8 @@ impl App {
         
         let target_fps = config.output_window.fps.max(1);
         let control_fps = config.control_window.fps.max(1);
+        let now = std::time::Instant::now();
+        let vsync = config.output_window.vsync;
         
         Self {
             config,
@@ -136,16 +140,16 @@ impl App {
             output_fullscreen: false,
             output_occluded: false,
             output_last_frame_time: None,
-            output_target_frame_duration: std::time::Duration::from_secs_f32(1.0 / target_fps as f32),
+            output_target_frame_duration: std::time::Duration::from_secs_f64(1.0 / target_fps as f64),
+            output_next_frame_time: now,
+            output_vsync_enabled: vsync,
             control_window: None,
             control_gui: None,
             imgui_renderer: None,
             control_needs_redraw: true,
             control_active_until: None,
             control_last_frame_time: None,
-            control_target_frame_duration: std::time::Duration::from_millis(
-                ((1000.0 / control_fps as f32).max(250.0)) as u64
-            ),
+            control_target_frame_duration: std::time::Duration::from_secs_f64(1.0 / control_fps.max(1) as f64),
             audio_input,
             video_input,
             shift_pressed: false,
@@ -481,7 +485,7 @@ impl App {
     /// Update output window target FPS
     fn set_output_fps(&mut self, fps: u32) {
         let fps = fps.max(1).min(240);
-        self.output_target_frame_duration = std::time::Duration::from_secs_f32(1.0 / fps as f32);
+        self.output_target_frame_duration = std::time::Duration::from_secs_f64(1.0 / fps as f64);
         self.config.output_window.fps = fps;
         
         // Update shared state so GUI can see the change
@@ -494,11 +498,15 @@ impl App {
             engine.set_target_fps(fps);
         }
         
-        log::info!("Output FPS set to {}", fps);
+        // Recalculate next frame time based on current time
+        self.output_next_frame_time = std::time::Instant::now() + self.output_target_frame_duration;
+        
+        log::info!("Output FPS set to {} (target frame duration: {:?})", fps, self.output_target_frame_duration);
     }
     
     /// Update output window VSync
     fn set_output_vsync(&mut self, enabled: bool) {
+        self.output_vsync_enabled = enabled;
         self.config.output_window.vsync = enabled;
         
         // Update shared state so GUI can see the change
@@ -511,7 +519,10 @@ impl App {
             engine.set_vsync(enabled);
         }
         
-        log::info!("Output VSync {}", if enabled { "enabled" } else { "disabled" });
+        log::info!("Output VSync {} (FPS limit: {})", 
+            if enabled { "enabled" } else { "disabled" },
+            if enabled { "display refresh rate".to_string() } else { format!("{} (software limited)", self.config.output_window.fps) }
+        );
     }
 }
 
@@ -760,10 +771,8 @@ impl ApplicationHandler for App {
                         }
                     }
                     WindowEvent::RedrawRequested => {
-                        if !self.output_occluded {
-                            if let Some(ref mut engine) = self.output_engine {
-                                engine.render();
-                            }
+                        if let Some(ref mut engine) = self.output_engine {
+                            engine.render(self.output_occluded);
                         }
                     }
                     _ => {}
@@ -851,7 +860,7 @@ impl ApplicationHandler for App {
         }
     }
     
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Update audio input
         if let Some(ref mut audio) = self.audio_input {
             // Get processed 8-band FFT (with amplitude/smoothing/normalization applied)
@@ -1069,57 +1078,37 @@ impl ApplicationHandler for App {
                 _ => {}
             }
             
-            // Handle NDI output command
-            #[cfg(feature = "ndi")]
+            // Handle output commands (NDI + Syphon)
             {
                 let mut state = self.shared_state.lock().unwrap();
-                let ndi_command = std::mem::replace(&mut state.ndi_output_command, crate::core::NdiOutputCommand::None);
+                let output_cmd = std::mem::replace(&mut state.output_command, crate::core::OutputCommand::None);
                 drop(state);
-                
-                match ndi_command {
-                    crate::core::NdiOutputCommand::Start { name, include_alpha, frame_skip } => {
-                        if let Some(ref mut engine) = self.output_engine {
+
+                if let Some(ref mut engine) = self.output_engine {
+                    match output_cmd {
+                        crate::core::OutputCommand::StartNdi { name, include_alpha, frame_skip } => {
+                            #[cfg(feature = "ndi")]
                             match engine.start_ndi_output(&name, include_alpha, frame_skip) {
                                 Ok(_) => log::info!("[ENGINE] NDI output started: '{}'", name),
                                 Err(e) => log::error!("[ENGINE] Failed to start NDI output: {:?}", e),
                             }
-                        } else {
-                            log::error!("[ENGINE] Output engine not initialized");
                         }
-                    }
-                    crate::core::NdiOutputCommand::Stop => {
-                        if let Some(ref mut engine) = self.output_engine {
+                        crate::core::OutputCommand::StopNdi => {
+                            #[cfg(feature = "ndi")]
                             engine.stop_ndi_output();
                         }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        
-        // Handle Syphon output commands
-        {
-            let mut state = self.shared_state.lock().unwrap();
-            let syphon_command = std::mem::replace(&mut state.syphon_output_command, crate::core::SyphonOutputCommand::None);
-            drop(state);
-            
-            match syphon_command {
-                crate::core::SyphonOutputCommand::Start { name } => {
-                    if let Some(ref mut engine) = self.output_engine {
-                        match engine.start_syphon_output(&name) {
-                            Ok(_) => log::info!("[ENGINE] Syphon output started: '{}'", name),
-                            Err(e) => log::error!("[ENGINE] Failed to start Syphon output: {:?}", e),
+                        crate::core::OutputCommand::StartSyphon { name } => {
+                            match engine.start_syphon_output(&name) {
+                                Ok(_) => log::info!("[ENGINE] Syphon output started: '{}'", name),
+                                Err(e) => log::error!("[ENGINE] Failed to start Syphon output: {:?}", e),
+                            }
                         }
-                    } else {
-                        log::error!("[ENGINE] Output engine not initialized");
+                        crate::core::OutputCommand::StopSyphon => {
+                            engine.stop_syphon_output();
+                        }
+                        crate::core::OutputCommand::None => {}
                     }
                 }
-                crate::core::SyphonOutputCommand::Stop => {
-                    if let Some(ref mut engine) = self.output_engine {
-                        engine.stop_syphon_output();
-                    }
-                }
-                _ => {}
             }
         }
         
@@ -1226,21 +1215,31 @@ impl ApplicationHandler for App {
             }
         }
         
-        // Request redraw for output window with frame rate limiting
+        // Request redraw for output window.
+        // Always request redraws even when occluded — the render function
+        // skips only the surface blit, keeping outputs streaming.
         if let Some(ref window) = self.output_window {
-            if !self.output_occluded {
+            if self.output_vsync_enabled {
+                // VSync mode: let the display compositor be the throttle.
+                // Always request redraw; present() will block to refresh rate.
+                window.request_redraw();
+            } else {
+                // Software frame limiter: only render when target duration has elapsed.
                 let now = std::time::Instant::now();
                 let should_render = match self.output_last_frame_time {
                     None => true,
-                    Some(last_time) => {
-                        let elapsed = now.duration_since(last_time);
-                        elapsed >= self.output_target_frame_duration
-                    }
+                    Some(last_time) => now.duration_since(last_time) >= self.output_target_frame_duration,
                 };
-                
+
                 if should_render {
                     self.output_last_frame_time = Some(now);
+                    self.output_next_frame_time = now + self.output_target_frame_duration;
                     window.request_redraw();
+                    use winit::event_loop::ControlFlow;
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                } else {
+                    use winit::event_loop::ControlFlow;
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(self.output_next_frame_time));
                 }
             }
         }
@@ -1290,6 +1289,12 @@ pub struct WgpuEngine {
     vertex_buffer: wgpu::Buffer,
     
     frame_count: u64,
+
+    // Output FPS measurement
+    fps_ring: [f32; 60],
+    fps_ring_index: usize,
+    fps_ring_count: usize,
+    last_render_time: Option<std::time::Instant>,
     
     /// Preview renderer for color picker
     preview_renderer: Option<crate::engine::preview::PreviewRenderer>,
@@ -1297,25 +1302,8 @@ pub struct WgpuEngine {
     /// Video recorder
     recorder: Option<crate::recorder::Recorder>,
     
-    /// Async NDI processor (background thread, requires ndi feature)
-    #[cfg(feature = "ndi")]
-    ndi_async: Option<crate::output::AsyncNdiOutput>,
-    
-    /// Triple-buffered GPU readback buffers for NDI output (as Arc for sharing)
-    ndi_buffers: Vec<Arc<wgpu::Buffer>>,
-    
-    /// Current frame counter for NDI timing
-    ndi_frame_counter: u64,
-    
-    /// Frame skip factor (process every Nth frame)
-    ndi_frame_skip: u8,
-    
-    /// Current skip counter
-    ndi_skip_counter: u8,
-    
-    /// Zero-copy Syphon output (macOS only, requires syphon feature)
-    #[cfg(all(target_os = "macos", feature = "syphon"))]
-    syphon_sender: Option<crate::output::SyphonWgpuSender>,
+    /// Unified output manager (NDI + Syphon dispatch, async readback pool)
+    output_manager: crate::output::OutputManager,
 }
 
 impl WgpuEngine {
@@ -1383,6 +1371,9 @@ impl WgpuEngine {
         } else {
             wgpu::PresentMode::AutoNoVsync
         };
+        
+        log::info!("Output surface configured: vsync={}, target_fps={}, present_mode={:?}", 
+            vsync, target_fps, present_mode);
         
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1585,6 +1576,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             input_texture_manager,
             vertex_buffer,
             frame_count: 0,
+            fps_ring: [0.0; 60],
+            fps_ring_index: 0,
+            fps_ring_count: 0,
+            last_render_time: None,
             
             // Initialize preview renderer (320x180 = 16:9 aspect)
             preview_renderer: Some(crate::engine::preview::PreviewRenderer::new(
@@ -1594,17 +1589,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // Initialize recorder (will be created when recording starts)
             recorder: None,
             
-            // Initialize NDI output (will be created when enabled, requires ndi feature)
-            #[cfg(feature = "ndi")]
-            ndi_async: None,
-            ndi_buffers: Vec::new(),
-            ndi_frame_counter: 0,
-            ndi_frame_skip: 1,
-            ndi_skip_counter: 0,
-            
-            // Initialize Syphon output (macOS only, requires syphon feature)
-            #[cfg(all(target_os = "macos", feature = "syphon"))]
-            syphon_sender: None,
+            output_manager: crate::output::OutputManager::new(),
         })
     }
     
@@ -1698,9 +1683,29 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         log::info!("Target FPS set to {}", self.target_fps);
     }
     
-    pub fn render(&mut self) {
+    pub fn render(&mut self, occluded: bool) {
+        // Measure actual output FPS
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_render_time {
+            let delta = now.duration_since(last).as_secs_f32();
+            if delta > 0.0 {
+                self.fps_ring[self.fps_ring_index] = 1.0 / delta;
+                self.fps_ring_index = (self.fps_ring_index + 1) % 60;
+                if self.fps_ring_count < 60 {
+                    self.fps_ring_count += 1;
+                }
+            }
+        }
+        self.last_render_time = Some(now);
+
         let mut state = self.shared_state.lock().unwrap();
-        
+
+        // Publish measured FPS to shared state for GUI display
+        if self.fps_ring_count > 0 {
+            let sum: f32 = self.fps_ring[..self.fps_ring_count].iter().sum();
+            state.output_actual_fps = sum / self.fps_ring_count as f32;
+        }
+
         let output_mode = state.output_mode;
         let block2_input_select = state.block2.block2_input_select;
         
@@ -1765,20 +1770,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 self.frame_count, _input1_has_data, _input2_has_data);
         }
         
-        let surface_texture = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(_) => {
-                self.surface.configure(&self.device, &self.config);
-                return;
-            }
-        };
-        
-        let surface_view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
+            label: Some("Pipeline Encoder"),
         });
         
         // Render modular Block 1
@@ -1911,52 +1904,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             },
         );
         
-        // Blit the selected output to the surface using a render pass
-        // This handles format conversion (Bgra8Unorm -> Bgra8UnormSrgb) for gamma-correct display
-        {
-            // Create a temporary bind group for blitting
-            let blit_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                ..Default::default()
-            });
-            
-            let blit_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Blit Bind Group"),
-                layout: &self.blit_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(_output_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&blit_sampler),
-                    },
-                ],
-            });
-            
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Blit Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &surface_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            
-            render_pass.set_pipeline(&self.blit_pipeline);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_bind_group(0, &blit_bind_group, &[]);
-            render_pass.draw(0..6, 0..1);
-        }
-        
+        // NOTE: Surface blit is deferred until after pipeline submit (see below).
+        // This allows the shader pipeline + outputs to always run even when occluded.
+
         // Copy render targets to feedback textures for next frame
         // This must happen after all render passes are done
         encoder.copy_texture_to_texture(
@@ -2039,65 +1989,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             }
         }
         
-        // Process NDI output (triple-buffered with frame-delayed readback for performance)
-        #[cfg(feature = "ndi")]
-        let ndi_buffer_idx = {
-            let ndi_width = self.block3_texture.width;
-            let ndi_height = self.block3_texture.height;
-            
-            // Increment skip counter and check if we should process this frame
-            // ndi_frame_skip = 0 means process every frame (no skip)
-            // ndi_frame_skip = 1 means process every 2nd frame (skip 1)
-            self.ndi_skip_counter = self.ndi_skip_counter.wrapping_add(1);
-            let should_process = self.ndi_skip_counter % (self.ndi_frame_skip + 1) == 0;
-            
-            // Increment frame counter
-            self.ndi_frame_counter = self.ndi_frame_counter.wrapping_add(1);
-            
-            // NDI status is now logged from the sender thread
-            
-            // NDI output processing
-            let mut ndi_buffer_to_process: Option<usize> = None;
-            if let Some(async_ndi) = self.ndi_async.as_ref() {
-                if should_process {
-                    // Try to acquire a free buffer
-                        if let Some((idx, buffer)) = async_ndi.acquire_buffer() {
-                            let layout = async_ndi.readback_layout();
-                            encoder.copy_texture_to_buffer(
-                                wgpu::TexelCopyTextureInfo {
-                                    texture: &self.block3_texture.texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                                },
-                                wgpu::TexelCopyBufferInfo {
-                                    buffer: buffer.as_ref(),
-                                    layout: wgpu::TexelCopyBufferLayout {
-                                        offset: 0,
-                                        bytes_per_row: Some(layout.padded_bytes_per_row),
-                                        rows_per_image: Some(ndi_height),
-                                    },
-                                },
-                            wgpu::Extent3d {
-                                width: ndi_width,
-                                height: ndi_height,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                        
-                        ndi_buffer_to_process = Some(idx);
-                        self.ndi_skip_counter = 0;
-                    }
-                }
-            }
-            
-            ndi_buffer_to_process
-        };
-        
-        #[cfg(not(feature = "ndi"))]
-        let ndi_buffer_idx: Option<usize> = None;
-        
-        // Note: Syphon zero-copy publish happens after submit, see below
+        // NOTE: Output submission (NDI readback + Syphon publish) happens after
+        // the pipeline encoder is submitted — see output_manager.submit_frame() below.
         
         // Handle recording commands
         let recording_command = {
@@ -2192,127 +2085,211 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // Validate dimensions
             if width == 0 || height == 0 {
                 log::error!("Invalid output texture dimensions: {}x{}", width, height);
-                // Stop recording to prevent further errors
                 if let Some(recorder) = self.recorder.take() {
                     drop(recorder);
                 }
                 if let Ok(mut state) = self.shared_state.lock() {
                     state.is_recording = false;
                 }
-                self.queue.submit(std::iter::once(encoder.finish()));
-                
-                // Process NDI buffer even in error case
-                #[cfg(feature = "ndi")]
-                if let (Some(idx), Some(async_ndi)) = (ndi_buffer_idx, self.ndi_async.as_ref()) {
-                    async_ndi.process_buffer_async(idx);
-                }
-                
-                // Publish to Syphon (zero-copy, macOS + syphon feature only)
-                #[cfg(all(target_os = "macos", feature = "syphon"))]
-                if let Some(ref mut syphon) = self.syphon_sender {
-                    syphon.publish(&self.block3_texture.texture, &self.device, &self.queue);
-                }
-                
-                surface_texture.present();
-                self.frame_count += 1;
-                return;
-            }
-            
-            let layout = ReadbackLayout::new(width, height);
-            let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Recording Staging Buffer"),
-                size: layout.buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            
-            // Copy output texture to staging buffer
-            // Note: output_texture is captured earlier in the render function
-            // We need to copy from the texture that was used as _output_view
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: output_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &staging_buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(layout.padded_bytes_per_row),
-                        rows_per_image: Some(height),
+            } else {
+                let layout = ReadbackLayout::new(width, height);
+                let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Recording Staging Buffer"),
+                    size: layout.buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: output_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
                     },
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            
-            // Submit copy command
-            self.queue.submit(std::iter::once(encoder.finish()));
-            
-            // Map buffer and read data synchronously
-            let buffer_slice = staging_buffer.slice(..);
-            let (tx, rx) = std::sync::mpsc::channel();
-            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send(result);
-            });
-            
-            // Wait for mapping to complete
-            if self.device.poll(wgpu::PollType::Wait).is_ok() {
-                if let Ok(Ok(())) = rx.recv() {
-                    // Read data and send to recorder
-                    let data = buffer_slice.get_mapped_range();
-                    let rgba_data = strip_readback_padding(&data, layout, height);
-                    if let Some(ref mut recorder) = self.recorder {
-                        if let Err(e) = recorder.write_frame(&rgba_data) {
-                            log::error!("Failed to write frame to recorder: {}", e);
-                            // Stop recording on error
-                            drop(self.recorder.take());
-                            if let Ok(mut state) = self.shared_state.lock() {
-                                state.is_recording = false;
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &staging_buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(layout.padded_bytes_per_row),
+                            rows_per_image: Some(height),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+
+                // Submit pipeline encoder (includes recording copy + NDI copy)
+                self.queue.submit(std::iter::once(encoder.finish()));
+
+                // Sync readback for recorder (must be synchronous for frame ordering)
+                let buffer_slice = staging_buffer.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+
+                if self.device.poll(wgpu::PollType::Wait).is_ok() {
+                    if let Ok(Ok(())) = rx.recv() {
+                        let data = buffer_slice.get_mapped_range();
+                        let rgba_data = strip_readback_padding(&data, layout, height);
+                        if let Some(ref mut recorder) = self.recorder {
+                            if let Err(e) = recorder.write_frame(&rgba_data) {
+                                log::error!("Failed to write frame to recorder: {}", e);
+                                drop(self.recorder.take());
+                                if let Ok(mut state) = self.shared_state.lock() {
+                                    state.is_recording = false;
+                                }
                             }
                         }
                     }
                 }
-            }
-            
-            // buffer_slice is automatically dropped when it goes out of scope
-            let _ = buffer_slice;
-            staging_buffer.unmap();
-            
-            // Process NDI buffer after submit (if we have one pending)
-            #[cfg(feature = "ndi")]
-            if let (Some(idx), Some(async_ndi)) = (ndi_buffer_idx, self.ndi_async.as_ref()) {
-                async_ndi.process_buffer_async(idx);
-            }
-            
-            // Publish to Syphon (zero-copy, macOS only)
-            #[cfg(all(target_os = "macos", feature = "syphon"))]
-            if let Some(ref mut syphon) = self.syphon_sender {
-                syphon.publish(&self.block3_texture.texture, &self.device, &self.queue);
-            }
-        } else {
-            self.queue.submit(std::iter::once(encoder.finish()));
-            
-            // Process NDI buffer after submit (if we have one pending)
-            #[cfg(feature = "ndi")]
-            if let (Some(idx), Some(async_ndi)) = (ndi_buffer_idx, self.ndi_async.as_ref()) {
-                async_ndi.process_buffer_async(idx);
-            }
-            
-            // Publish to Syphon (zero-copy, macOS + syphon feature only)
-            #[cfg(all(target_os = "macos", feature = "syphon"))]
-            if let Some(ref mut syphon) = self.syphon_sender {
-                syphon.publish(&self.block3_texture.texture, &self.device, &self.queue);
+                let _ = buffer_slice;
+                staging_buffer.unmap();
+
+                // Submit to output sinks (NDI readback + Syphon zero-copy)
+                self.output_manager.submit_frame(
+                    &self.block3_texture.texture, &self.device, &self.queue,
+                );
+
+                // ── Blit to screen (skip when occluded) ──────────────────
+                if !occluded {
+                    match self.surface.get_current_texture() {
+                        Ok(surface_texture) => {
+                            let surface_view = surface_texture
+                                .texture
+                                .create_view(&wgpu::TextureViewDescriptor::default());
+
+                            let blit_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+                                mag_filter: wgpu::FilterMode::Linear,
+                                min_filter: wgpu::FilterMode::Linear,
+                                ..Default::default()
+                            });
+                            let blit_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("Blit Bind Group"),
+                                layout: &self.blit_bind_group_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(_output_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::Sampler(&blit_sampler),
+                                    },
+                                ],
+                            });
+
+                            let mut blit_encoder = self.device.create_command_encoder(
+                                &wgpu::CommandEncoderDescriptor { label: Some("Blit Encoder") },
+                            );
+                            {
+                                let mut render_pass = blit_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("Blit Pass"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: &surface_view,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                });
+                                render_pass.set_pipeline(&self.blit_pipeline);
+                                render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                                render_pass.set_bind_group(0, &blit_bind_group, &[]);
+                                render_pass.draw(0..6, 0..1);
+                            }
+                            self.queue.submit(std::iter::once(blit_encoder.finish()));
+                            surface_texture.present();
+                        }
+                        Err(e) => {
+                            log::debug!("Surface unavailable, reconfiguring: {}", e);
+                            self.surface.configure(&self.device, &self.config);
+                        }
+                    }
+                }
+
+                self.frame_count += 1;
+                return;
             }
         }
-        
-        surface_texture.present();
-        
+
+        // Non-recording path: submit pipeline encoder, then outputs, then blit
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Submit to output sinks (NDI readback + Syphon zero-copy)
+        self.output_manager.submit_frame(
+            &self.block3_texture.texture, &self.device, &self.queue,
+        );
+
+        // ── Blit to screen (skip when occluded) ──────────────────────
+        if !occluded {
+            match self.surface.get_current_texture() {
+                Ok(surface_texture) => {
+                    let surface_view = surface_texture
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+
+                    let blit_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+                        mag_filter: wgpu::FilterMode::Linear,
+                        min_filter: wgpu::FilterMode::Linear,
+                        ..Default::default()
+                    });
+                    let blit_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Blit Bind Group"),
+                        layout: &self.blit_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(_output_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Sampler(&blit_sampler),
+                            },
+                        ],
+                    });
+
+                    let mut blit_encoder = self.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor { label: Some("Blit Encoder") },
+                    );
+                    {
+                        let mut render_pass = blit_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("Blit Pass"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &surface_view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                        render_pass.set_pipeline(&self.blit_pipeline);
+                        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+                        render_pass.set_bind_group(0, &blit_bind_group, &[]);
+                        render_pass.draw(0..6, 0..1);
+                    }
+                    self.queue.submit(std::iter::once(blit_encoder.finish()));
+                    surface_texture.present();
+                }
+                Err(e) => {
+                    log::debug!("Surface unavailable, reconfiguring: {}", e);
+                    self.surface.configure(&self.device, &self.config);
+                }
+            }
+        }
+
         self.frame_count += 1;
     }
     
@@ -2344,126 +2321,61 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     /// Start NDI output
     #[cfg(feature = "ndi")]
     pub fn start_ndi_output(&mut self, name: &str, include_alpha: bool, frame_skip: u8) -> anyhow::Result<()> {
-        // Stop existing NDI output if any
-        self.stop_ndi_output();
-        
-        // Use actual block3 texture dimensions, not config dimensions
         let width = self.block3_texture.width;
         let height = self.block3_texture.height;
-        
-        let skip = frame_skip.max(1);
-        self.ndi_frame_skip = skip;
-        self.ndi_skip_counter = 0;
-        
-        log::info!("[ENGINE] Starting NDI output: {} ({}x{}, alpha={}, skip={})", name, width, height, include_alpha, skip);
-        
-        // Create triple-buffered readback buffers as Arc for sharing
-        let buffer_size = (width * height * 4) as u64;
-        self.ndi_buffers.clear();
-        for i in 0..3 {
-            let buffer = Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(&format!("NDI Readback Buffer {}", i)),
-                size: buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            }));
-            self.ndi_buffers.push(buffer);
-        }
-        self.ndi_frame_counter = 0;
-        
-        // Create NDI sender
-        let ndi_sender = crate::output::NdiOutputSender::new(name, width, height, include_alpha)?;
-        
-        // Create async processor
-        let processor = crate::output::AsyncNdiOutput::new(
-            &self.device,
-            ndi_sender,
-            width,
-            height,
-        );
-        
-        self.ndi_async = Some(processor);
-        
-        // Update shared state
+        self.output_manager.start_ndi(name, width, height, include_alpha, frame_skip)?;
         if let Ok(mut state) = self.shared_state.lock() {
             state.ndi_output_active = true;
         }
-        
         Ok(())
     }
-    
+
     /// Stop NDI output
     #[cfg(feature = "ndi")]
     pub fn stop_ndi_output(&mut self) {
-        if self.ndi_async.is_some() {
-            self.ndi_async = None;
-            self.ndi_buffers.clear();
-            self.ndi_frame_counter = 0;
-            self.ndi_frame_skip = 1;
-            self.ndi_skip_counter = 0;
-            
-            if let Ok(mut state) = self.shared_state.lock() {
-                state.ndi_output_active = false;
-            }
+        self.output_manager.stop_ndi();
+        if let Ok(mut state) = self.shared_state.lock() {
+            state.ndi_output_active = false;
         }
     }
-    
+
     /// Start Syphon output (macOS only, requires syphon feature)
     #[cfg(all(target_os = "macos", feature = "syphon"))]
     pub fn start_syphon_output(&mut self, name: &str) -> anyhow::Result<()> {
-        // Stop existing Syphon output if any
-        self.stop_syphon_output();
-        
-        // Use actual texture dimensions, not config (they may differ)
         let width = self.block3_texture.texture.width();
         let height = self.block3_texture.texture.height();
-        
-        log::info!("[Engine] Starting Syphon output '{}' at {}x{}", name, width, height);
-        
-        // Create zero-copy Syphon sender
-        let sender = crate::output::SyphonWgpuSender::new(
-            name,
-            &self.device,
-            &self.queue,
-            width,
-            height,
-        )?;
-        
-        self.syphon_sender = Some(sender);
-        
-        // Update shared state
+        self.output_manager.start_syphon(name, &self.device, &self.queue, width, height)?;
         if let Ok(mut state) = self.shared_state.lock() {
             state.syphon_output_active = true;
         }
-        
-        log::info!("[Engine] Syphon output started (zero-copy: {})", 
-            self.syphon_sender.as_ref().map_or(false, |s| s.is_zero_copy()));
-        
+        log::info!("[Engine] Syphon output started (zero-copy: {})",
+            self.output_manager.syphon_is_zero_copy());
         Ok(())
     }
-    
+
     /// Stop Syphon output (macOS only, requires syphon feature)
     #[cfg(all(target_os = "macos", feature = "syphon"))]
     pub fn stop_syphon_output(&mut self) {
-        if self.syphon_sender.is_some() {
-            log::info!("[Engine] Stopping Syphon output");
-            self.syphon_sender = None;
-            
-            if let Ok(mut state) = self.shared_state.lock() {
-                state.syphon_output_active = false;
-            }
+        self.output_manager.stop_syphon();
+        if let Ok(mut state) = self.shared_state.lock() {
+            state.syphon_output_active = false;
         }
     }
-    
+
     /// Stub for non-macOS platforms or when syphon feature is disabled
     #[cfg(not(all(target_os = "macos", feature = "syphon")))]
     pub fn start_syphon_output(&mut self, _name: &str) -> anyhow::Result<()> {
         Err(anyhow::anyhow!("Syphon is only available on macOS with the 'syphon' feature enabled"))
     }
-    
+
     /// Stub for non-macOS platforms or when syphon feature is disabled
     #[cfg(not(all(target_os = "macos", feature = "syphon")))]
     pub fn stop_syphon_output(&mut self) {}
+
+    /// Drain readback pool while the GPU device is still alive.
+    pub fn drain_readback(&mut self) {
+        self.output_manager.drain_readback(&self.device);
+    }
     
     /// Stub for when NDI feature is disabled
     #[cfg(not(feature = "ndi"))]

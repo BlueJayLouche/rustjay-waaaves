@@ -46,20 +46,14 @@ pub enum InputChangeRequest {
     SetOutputFps(u32),
 }
 
-/// NDI Output command
+/// Unified output command
 #[derive(Debug, Clone, PartialEq)]
-pub enum NdiOutputCommand {
+pub enum OutputCommand {
     None,
-    Start { name: String, include_alpha: bool, frame_skip: u8 },
-    Stop,
-}
-
-/// Syphon Output command (macOS)
-#[derive(Debug, Clone, PartialEq)]
-pub enum SyphonOutputCommand {
-    None,
-    Start { name: String },
-    Stop,
+    StartNdi { name: String, include_alpha: bool, frame_skip: u8 },
+    StopNdi,
+    StartSyphon { name: String },
+    StopSyphon,
 }
 
 /// Audio change request
@@ -194,12 +188,10 @@ pub struct SharedState {
     pub input2_change_request: InputChangeRequest,
     /// Audio change request (GUI -> Engine)
     pub audio_change_request: AudioChangeRequest,
-    /// NDI output command (GUI -> Engine)
-    pub ndi_output_command: NdiOutputCommand,
+    /// Output command (GUI -> Engine)
+    pub output_command: OutputCommand,
     /// NDI output status (Engine -> GUI)
     pub ndi_output_active: bool,
-    /// Syphon output command (GUI -> Engine)
-    pub syphon_output_command: SyphonOutputCommand,
     /// Syphon output status (Engine -> GUI)
     pub syphon_output_active: bool,
     /// Output display mode (which block to show)
@@ -227,6 +219,8 @@ pub struct SharedState {
     pub preview_enabled: bool,
     /// Output window target FPS (for GUI display)
     pub output_fps: u32,
+    /// Output window actual measured FPS (engine → GUI)
+    pub output_actual_fps: f32,
     /// Output window VSync enabled (for GUI display)
     pub output_vsync: bool,
     /// MIDI state for parameter mapping and learn
@@ -287,9 +281,8 @@ impl SharedState {
             input1_change_request: InputChangeRequest::None,
             input2_change_request: InputChangeRequest::None,
             audio_change_request: AudioChangeRequest::None,
-            ndi_output_command: NdiOutputCommand::None,
+            output_command: OutputCommand::None,
             ndi_output_active: false,
-            syphon_output_command: SyphonOutputCommand::None,
             syphon_output_active: false,
             output_mode: OutputMode::default(),
             bpm: 120.0,
@@ -303,6 +296,7 @@ impl SharedState {
             preview_pick_requested: false,
             preview_enabled: true,                   // Preview starts enabled
             output_fps: config.output_window.fps,    // Initial FPS from config
+            output_actual_fps: 0.0,
             output_vsync: config.output_window.vsync, // Initial VSync from config
             midi: {
                 let mut midi = MidiState::new();

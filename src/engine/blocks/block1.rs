@@ -2130,6 +2130,12 @@ impl ModularBlock1 {
         };
         self.write_stage3_uniforms(queue, &stage3_uniforms);
         
+        // Lazily allocate delay buffers when delay is active
+        let delay_frames = params.fb1_delay_time as usize;
+        if delay_frames > 0 {
+            self.resources.ensure_delay_capacity(device, queue, delay_frames, "Block1");
+        }
+
         let stage3_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Block1 Stage3 Bind Group"),
             layout: &self.stage3_bind_group_layout,
@@ -2145,7 +2151,7 @@ impl ModularBlock1 {
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(self.resources.get_feedback_view()) },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.create_sampler(device)) },
                 // Delay buffer (for feedback delay)
-                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(self.resources.get_delay_view(params.fb1_delay_time as usize)) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(self.resources.get_delay_view(delay_frames)) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&self.create_sampler(device)) },
             ],
         });
