@@ -18,6 +18,17 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use realfft::{num_complex::Complex32, RealFftPlanner};
 use std::sync::{Arc, Mutex};
 
+/// Available FFT sizes (must be powers of 2)
+pub const FFT_SIZES: &[usize] = &[1024, 2048, 4096, 8192];
+
+/// Human-readable labels for the FFT size dropdown
+pub const FFT_SIZE_LABELS: &[&str] = &[
+    "1024  (43 Hz, 23ms)",
+    "2048  (21 Hz, 46ms)",
+    "4096  (11 Hz, 93ms)",
+    "8192  (5 Hz, 186ms)",
+];
+
 /// 8 FFT Bands matching the OF app
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FftBand {
@@ -468,16 +479,15 @@ impl AudioInput {
                         
                         if fft.process(&mut input, &mut output).is_ok() {
                             // Calculate magnitude spectrum
+                            // Normalize by fft_size (realfft does NOT divide by N)
+                            let fft_norm = 1.0 / fft_size as f32;
+                            let gain = amplitude.max(0.0001); // Prevent zero gain issues
                             let mut bins = Vec::with_capacity(fft_size / 2);
                             let mut total_energy = 0.0f32;
-                            
+
                             for i in 0..(fft_size / 2) {
-                                let magnitude = output[i].norm();
-                                // Apply amplitude as gain BEFORE dB conversion
-                                // This preserves dynamic range and noise floor behavior
-                                let gain = amplitude.max(0.0001); // Prevent zero gain issues
-                                let scaled_magnitude = magnitude * gain;
-                                let db = 20.0 * (scaled_magnitude + 1e-10).log10();
+                                let magnitude = output[i].norm() * fft_norm * gain;
+                                let db = 20.0 * (magnitude + 1e-10).log10();
                                 let normalized = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
                                 bins.push(normalized);
                                 total_energy += normalized;
@@ -700,17 +710,19 @@ pub fn get_treble_energy(bins: &[f32], sample_rate: u32, fft_size: usize) -> f32
     }
 }
 
-/// Pink noise compensation gains for each band (+3dB/octave slope)
-/// Makes pink noise appear flat across all bands
+/// Pink noise compensation gains for each band.
+/// Moderate multiplicative gains that work with dB-normalized 0-1 values.
+/// Old values (up to 11.3) were designed for linear space and clamped everything;
+/// these are gentler and let the .min(1.0) clamp catch only actual peaks.
 const PINK_NOISE_GAINS: [f32; 8] = [
-    1.0,       // Sub Bass (reference)
-    1.4,       // Bass (+3dB)
-    2.0,       // Low Mid (+6dB)
-    2.8,       // Mid (+9dB)
-    4.0,       // High Mid (+12dB)
-    5.6,       // High (+15dB)
-    8.0,       // Very High (+18dB)
-    11.3,      // Presence (+21dB)
+    1.0,       // Sub Bass  ~40 Hz (reference)
+    1.15,      // Bass      ~90 Hz
+    1.30,      // Low Mid   ~185 Hz
+    1.50,      // Mid       ~375 Hz
+    1.80,      // High Mid  ~1000 Hz
+    2.20,      // High      ~3000 Hz
+    2.60,      // Very High ~6000 Hz
+    3.00,      // Presence  ~12000 Hz
 ];
 
 /// Compute 8-band FFT from raw FFT bins
@@ -734,19 +746,22 @@ fn compute_8band_fft(bins: &[f32], sample_rate: u32, fft_size: usize, bands: &mu
     for (i, (min_freq, max_freq)) in band_ranges.iter().enumerate() {
         let start_bin = ((min_freq * bins_per_hz) as usize).min(bins.len() - 1);
         let end_bin = ((max_freq * bins_per_hz) as usize).min(bins.len());
-        
+
         if end_bin > start_bin {
-            // Calculate average energy in this band
-            let sum: f32 = bins[start_bin..end_bin].iter().sum();
-            let avg = sum / (end_bin - start_bin) as f32;
-            
-            // Apply pink noise compensation if enabled
+            // Use peak (max) per band instead of average.
+            // This prevents dilution in high-frequency bands that span many bins.
+            let peak = bins[start_bin..end_bin]
+                .iter()
+                .cloned()
+                .fold(0.0f32, f32::max);
+
+            // Apply pink noise compensation if enabled (multiplicative, clamped to 1.0)
             let compensated = if pink_compensation {
-                avg * PINK_NOISE_GAINS[i]
+                (peak * PINK_NOISE_GAINS[i]).min(1.0)
             } else {
-                avg
+                peak
             };
-            
+
             // Update raw band value
             bands.bands[i] = compensated;
             

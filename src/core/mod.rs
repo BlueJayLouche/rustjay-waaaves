@@ -61,6 +61,7 @@ pub enum OutputCommand {
 pub enum AudioChangeRequest {
     None,
     ChangeDevice { device_index: i32 },
+    ChangeFftSize { fft_size: usize },
 }
 
 /// Output display mode - which block to show
@@ -248,6 +249,8 @@ pub struct AudioState {
     pub normalization: bool,
     /// Pink noise compensation (makes pink noise appear flat)
     pub pink_compensation: bool,
+    /// Current FFT size (for display/UI, actual change requires stream rebuild)
+    pub fft_size: usize,
 }
 
 impl SharedState {
@@ -270,7 +273,10 @@ impl SharedState {
             block1_lfo_map: HashMap::new(),
             block2_lfo_map: HashMap::new(),
             block3_lfo_map: HashMap::new(),
-            audio: AudioState::default(),
+            audio: AudioState {
+                fft_size: config.audio.fft_size,
+                ..AudioState::default()
+            },
             frame_count: 0,
             clear_feedback: false,
             output_size: (output_width, output_height),
@@ -322,6 +328,7 @@ impl Default for AudioState {
             smoothing: 0.7,      // Default: 70% smoothing
             normalization: false, // Default: off
             pink_compensation: false, // Default: off
+            fft_size: 1024,      // Default FFT size
         }
     }
 }

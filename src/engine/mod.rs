@@ -1075,6 +1075,25 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                crate::core::AudioChangeRequest::ChangeFftSize { fft_size } => {
+                    log::info!("Processing FFT size change request to {}", fft_size);
+                    self.config.audio.fft_size = fft_size;
+                    // Stop current audio
+                    if let Some(ref mut audio) = self.audio_input {
+                        let _ = audio.stop();
+                    }
+                    // Rebuild with new FFT size
+                    let mut new_audio = AudioInput::new(fft_size);
+                    match new_audio.initialize() {
+                        Ok(_) => {
+                            log::info!("Audio reinitialized with FFT size {}", fft_size);
+                            self.audio_input = Some(new_audio);
+                        }
+                        Err(e) => {
+                            log::error!("Failed to reinitialize audio with FFT size {}: {:?}", fft_size, e);
+                        }
+                    }
+                }
                 _ => {}
             }
             
