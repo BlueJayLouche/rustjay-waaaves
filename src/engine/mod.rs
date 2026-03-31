@@ -957,6 +957,23 @@ impl ApplicationHandler for App {
                         log::error!("[INPUT] Video input manager not initialized");
                     }
                 }
+                crate::core::InputChangeRequest::StartSpout { sender_name, .. } => {
+                    if let Some(ref mut engine) = self.output_engine {
+                        engine.input_texture_manager.clear_input1();
+                        let queue = std::sync::Arc::clone(&engine.queue);
+                        engine.modular_block1.clear_all(&queue);
+                        engine.modular_block1.invalidate_bind_group_caches();
+                        engine.modular_block2.clear_all(&queue);
+                    }
+                    if let Some(ref mut video) = self.video_input {
+                        match video.start_input1_spout(&sender_name) {
+                            Ok(_) => log::info!("[INPUT] Started Spout input 1: {}", sender_name),
+                            Err(e) => log::error!("[INPUT] Failed to start Spout input 1: {:?}", e),
+                        }
+                    } else {
+                        log::error!("[INPUT] Video input manager not initialized");
+                    }
+                }
                 crate::core::InputChangeRequest::StopInput { .. } => {
                     if let Some(ref mut engine) = self.output_engine {
                         engine.input_texture_manager.clear_input1();
@@ -1031,6 +1048,23 @@ impl ApplicationHandler for App {
                         match video.start_input2_syphon(&server_name) {
                             Ok(_) => log::info!("[INPUT] Started Syphon input 2: {}", server_name),
                             Err(e) => log::error!("[INPUT] Failed to start Syphon input 2: {:?}", e),
+                        }
+                    } else {
+                        log::error!("[INPUT] Video input manager not initialized");
+                    }
+                }
+                crate::core::InputChangeRequest::StartSpout { sender_name, .. } => {
+                    if let Some(ref mut engine) = self.output_engine {
+                        engine.input_texture_manager.clear_input2();
+                        let queue = std::sync::Arc::clone(&engine.queue);
+                        engine.modular_block1.clear_all(&queue);
+                        engine.modular_block1.invalidate_bind_group_caches();
+                        engine.modular_block2.clear_all(&queue);
+                    }
+                    if let Some(ref mut video) = self.video_input {
+                        match video.start_input2_spout(&sender_name) {
+                            Ok(_) => log::info!("[INPUT] Started Spout input 2: {}", sender_name),
+                            Err(e) => log::error!("[INPUT] Failed to start Spout input 2: {:?}", e),
                         }
                     } else {
                         log::error!("[INPUT] Video input manager not initialized");
@@ -1124,6 +1158,15 @@ impl ApplicationHandler for App {
                         }
                         crate::core::OutputCommand::StopSyphon => {
                             engine.stop_syphon_output();
+                        }
+                        crate::core::OutputCommand::StartSpout { name } => {
+                            match engine.start_spout_output(&name) {
+                                Ok(_) => log::info!("[ENGINE] Spout output started: '{}'", name),
+                                Err(e) => log::error!("[ENGINE] Failed to start Spout output: {:?}", e),
+                            }
+                        }
+                        crate::core::OutputCommand::StopSpout => {
+                            engine.stop_spout_output();
                         }
                         crate::core::OutputCommand::None => {}
                     }
@@ -2390,6 +2433,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     /// Stub for non-macOS platforms or when syphon feature is disabled
     #[cfg(not(all(target_os = "macos", feature = "syphon")))]
     pub fn stop_syphon_output(&mut self) {}
+
+    /// Start Spout output (Windows only, requires ipc-spout feature)
+    pub fn start_spout_output(&mut self, name: &str) -> anyhow::Result<()> {
+        let width = self.block3_texture.texture.width();
+        let height = self.block3_texture.texture.height();
+        self.output_manager.start_spout(name, width, height)?;
+        if let Ok(mut state) = self.shared_state.lock() {
+            state.spout_output_active = true;
+        }
+        log::info!("[Engine] Spout output started: '{}' {}x{}", name, width, height);
+        Ok(())
+    }
+
+    /// Stop Spout output
+    pub fn stop_spout_output(&mut self) {
+        self.output_manager.stop_spout();
+        if let Ok(mut state) = self.shared_state.lock() {
+            state.spout_output_active = false;
+        }
+    }
 
     /// Drain readback pool while the GPU device is still alive.
     pub fn drain_readback(&mut self) {

@@ -263,6 +263,10 @@ pub mod platform {
 // Platform-specific implementations
 #[cfg(all(target_os = "macos", feature = "ipc-syphon"))]
 pub mod syphon;
+#[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+pub mod spout;
+#[cfg(all(target_os = "linux", feature = "ipc-v4l2"))]
+pub mod v4l2;
 
 /// Factory functions for creating platform-specific implementations
 pub mod factory {
@@ -274,11 +278,11 @@ pub mod factory {
         {
             return Some(Box::new(syphon::SyphonInput::new()));
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
         {
             return Some(Box::new(spout::SpoutInput::new()));
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "ipc-v4l2"))]
         {
             return Some(Box::new(v4l2::V4L2Input::new()));
         }
@@ -291,11 +295,11 @@ pub mod factory {
         {
             return Some(Box::new(syphon::SyphonOutput::new()));
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
         {
             return Some(Box::new(spout::SpoutOutput::new()));
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "ipc-v4l2"))]
         {
             return Some(Box::new(v4l2::V4L2Output::new()));
         }
@@ -308,11 +312,11 @@ pub mod factory {
         {
             return Some(Box::new(syphon::SyphonDiscovery::new()));
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
         {
             return Some(Box::new(spout::SpoutDiscovery::new()));
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "ipc-v4l2"))]
         {
             return Some(Box::new(v4l2::V4L2Discovery::new()));
         }

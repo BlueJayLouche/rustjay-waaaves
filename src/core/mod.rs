@@ -39,6 +39,7 @@ pub enum InputChangeRequest {
     StartWebcam { input_id: u8, device_index: usize, width: u32, height: u32, fps: u32 },
     StartNdi { input_id: u8, source_name: String },
     StartSyphon { input_id: u8, server_name: String },
+    StartSpout { input_id: u8, sender_name: String },
     StopInput { input_id: u8 },
     /// Set output window VSync
     SetVsync(bool),
@@ -54,6 +55,8 @@ pub enum OutputCommand {
     StopNdi,
     StartSyphon { name: String },
     StopSyphon,
+    StartSpout { name: String },
+    StopSpout,
 }
 
 /// Audio change request
@@ -195,6 +198,8 @@ pub struct SharedState {
     pub ndi_output_active: bool,
     /// Syphon output status (Engine -> GUI)
     pub syphon_output_active: bool,
+    /// Spout output status (Engine -> GUI)
+    pub spout_output_active: bool,
     /// Output display mode (which block to show)
     pub output_mode: OutputMode,
     /// Global BPM for tempo-synced LFOs
@@ -290,6 +295,7 @@ impl SharedState {
             output_command: OutputCommand::None,
             ndi_output_active: false,
             syphon_output_active: false,
+            spout_output_active: false,
             output_mode: OutputMode::default(),
             bpm: 120.0,
             block1_modulations: HashMap::new(),

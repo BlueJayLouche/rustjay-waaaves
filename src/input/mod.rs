@@ -93,6 +93,7 @@ impl Default for SyphonDiscovery {
 #[derive(Debug, Clone)]
 pub struct SyphonServerInfo {
     pub name: String,
+    pub app_name: String,
 }
 
 #[cfg(not(all(target_os = "macos", feature = "syphon")))]
@@ -172,6 +173,10 @@ pub fn list_cameras() -> Vec<String> {
     Vec::new()
 }
 
+// Spout input support (Windows only, requires ipc-spout feature)
+#[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+use crate::ipc::spout::SpoutInput as SpoutIpcInput;
+
 mod texture_input;
 pub use texture_input::InputTextureManager;
 
@@ -240,6 +245,11 @@ pub struct InputSource {
     syphon_receiver: Option<SyphonWgpuInput>,
     #[cfg(not(all(target_os = "macos", feature = "syphon")))]
     syphon_receiver: Option<()>,
+    /// Spout receiver instance (Windows only, CPU readback path)
+    #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+    spout_receiver: Option<SpoutIpcInput>,
+    #[cfg(not(all(target_os = "windows", feature = "ipc-spout")))]
+    spout_receiver: Option<()>,
     /// wgpu device for GPU operations
     device: Option<Arc<wgpu::Device>>,
     /// wgpu queue for GPU operations
@@ -446,7 +456,17 @@ impl InputManager {
     pub fn start_input2_syphon(&mut self, _server_name: impl Into<String>) -> Result<()> {
         Err(anyhow::anyhow!("Syphon input is only available on macOS"))
     }
-    
+
+    /// Start Spout on input 1
+    pub fn start_input1_spout(&mut self, sender_name: impl Into<String>) -> Result<()> {
+        self.input1.start_spout(sender_name)
+    }
+
+    /// Start Spout on input 2
+    pub fn start_input2_spout(&mut self, sender_name: impl Into<String>) -> Result<()> {
+        self.input2.start_spout(sender_name)
+    }
+
     /// Stop input 1
     pub fn stop_input1(&mut self) {
         self.input1.stop();
@@ -503,6 +523,7 @@ impl InputSource {
             current_frame: None,
             ndi_receiver: None,
             syphon_receiver: None,
+            spout_receiver: None,
             device: None,
             queue: None,
         }
@@ -590,7 +611,32 @@ impl InputSource {
     pub fn start_syphon(&mut self, _server_name: impl Into<String>) -> Result<()> {
         Err(anyhow::anyhow!("Syphon input is only available on macOS with the 'syphon' feature enabled"))
     }
-    
+
+    /// Start Spout receiver (Windows only, requires ipc-spout feature) - CPU readback path
+    #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+    pub fn start_spout(&mut self, sender_name: impl Into<String>) -> Result<()> {
+        use crate::ipc::IpcInput;
+        self.stop();
+
+        let sender_name = sender_name.into();
+        let mut spout = SpoutIpcInput::new();
+        spout.connect(&sender_name)
+            .map_err(|e| anyhow::anyhow!("Spout connect failed: {}", e))?;
+
+        self.input_type = InputType::Spout;
+        self.active = true;
+        self.spout_receiver = Some(spout);
+
+        log::info!("[Input] Started Spout input from sender: {}", sender_name);
+        Ok(())
+    }
+
+    /// Start Spout receiver (stub when not on Windows or ipc-spout feature disabled)
+    #[cfg(not(all(target_os = "windows", feature = "ipc-spout")))]
+    pub fn start_spout(&mut self, _sender_name: impl Into<String>) -> Result<()> {
+        Err(anyhow::anyhow!("Spout input is only available on Windows with the 'ipc-spout' feature enabled"))
+    }
+
     /// Stop the input source
     pub fn stop(&mut self) {
         self.active = false;
@@ -608,7 +654,19 @@ impl InputSource {
         {
             self.syphon_receiver = None;
         }
-        
+
+        #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+        {
+            if let Some(mut spout) = self.spout_receiver.take() {
+                use crate::ipc::IpcInput;
+                spout.disconnect();
+            }
+        }
+        #[cfg(not(all(target_os = "windows", feature = "ipc-spout")))]
+        {
+            self.spout_receiver = None;
+        }
+
         self.frame_receiver = None;
         self.current_frame = None;
         self.input_type = InputType::None;
@@ -669,8 +727,24 @@ impl InputSource {
                 }
             }
         }
+
+        // Handle Spout frames (Windows only, requires ipc-spout feature) - CPU readback
+        #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+        {
+            if let Some(ref mut spout) = self.spout_receiver {
+                use crate::ipc::IpcInput;
+                if let Some(frame) = spout.receive_frame() {
+                    match frame {
+                        crate::ipc::IpcFrame::CpuBuffer { data, width, height, .. } => {
+                            self.resolution = (width, height);
+                            self.current_frame = Some(data);
+                        }
+                    }
+                }
+            }
+        }
     }
-    
+
     /// Check if there's a new frame available
     pub fn has_new_frame(&self) -> bool {
         self.current_frame.is_some()

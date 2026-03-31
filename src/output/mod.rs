@@ -27,6 +27,10 @@ pub mod syphon_async;
 #[cfg(all(target_os = "macos", feature = "syphon"))]
 pub use syphon_async::{AsyncSyphonOutput, SyphonOutputIntegration};
 
+// Spout output (Windows only, requires ipc-spout feature)
+#[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+use crate::ipc::spout::SpoutOutput as SpoutIpcOutput;
+
 use readback::ReadbackPool;
 
 // ---------------------------------------------------------------------------
@@ -43,7 +47,11 @@ pub struct OutputManager {
     #[cfg(all(target_os = "macos", feature = "syphon"))]
     syphon: Option<SyphonWgpuSender>,
 
-    /// Async readback pool for CPU-path outputs (NDI).
+    /// Spout D3D11 shared texture output (Windows)
+    #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+    spout: Option<SpoutIpcOutput>,
+
+    /// Async readback pool for CPU-path outputs (NDI, Spout).
     readback_pool: ReadbackPool,
 
     /// Frame skip factor for NDI (0 = every frame, 1 = every 2nd, etc.)
@@ -60,6 +68,8 @@ impl OutputManager {
             ndi: None,
             #[cfg(all(target_os = "macos", feature = "syphon"))]
             syphon: None,
+            #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+            spout: None,
             readback_pool: ReadbackPool::new(),
             #[cfg(feature = "ndi")]
             frame_skip: 1,
@@ -144,12 +154,60 @@ impl OutputManager {
         self.syphon.as_ref().map_or(false, |s| s.is_zero_copy())
     }
 
+    // ── Spout (Windows) ────────────────────────────────────────────
+
+    /// Start (or restart) Spout output.
+    #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+    pub fn start_spout(
+        &mut self,
+        name: &str,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        use crate::ipc::IpcOutput;
+        self.stop_spout();
+        let mut sender = SpoutIpcOutput::new();
+        sender.create_server(name, width, height)
+            .map_err(|e| anyhow::anyhow!("Spout create_server failed: {}", e))?;
+        self.spout = Some(sender);
+        log::info!("Spout output started: {} ({}x{})", name, width, height);
+        Ok(())
+    }
+
+    /// Stop Spout output.
+    #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+    pub fn stop_spout(&mut self) {
+        if self.spout.take().is_some() {
+            log::info!("Spout output stopped");
+        }
+    }
+
+    /// Whether Spout output is currently active.
+    #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+    pub fn spout_active(&self) -> bool {
+        self.spout.is_some()
+    }
+
+    // Spout stubs for non-Windows
+    #[cfg(not(all(target_os = "windows", feature = "ipc-spout")))]
+    pub fn start_spout(&mut self, _name: &str, _width: u32, _height: u32) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("Spout output is only available on Windows"))
+    }
+    #[cfg(not(all(target_os = "windows", feature = "ipc-spout")))]
+    pub fn stop_spout(&mut self) {}
+    #[cfg(not(all(target_os = "windows", feature = "ipc-spout")))]
+    pub fn spout_active(&self) -> bool { false }
+
     // ── Frame submission ──────────────────────────────────────────────
 
     /// Returns true if any CPU-path output needs readback.
     fn needs_readback(&self) -> bool {
         #[cfg(feature = "ndi")]
         if self.ndi.is_some() {
+            return true;
+        }
+        #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+        if self.spout.is_some() {
             return true;
         }
         false
@@ -177,6 +235,14 @@ impl OutputManager {
                 #[cfg(feature = "ndi")]
                 if let Some(ref ndi) = self.ndi {
                     ndi.submit_frame(&data, width, height);
+                }
+
+                #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+                if let Some(ref mut spout) = self.spout {
+                    use crate::ipc::IpcOutput;
+                    if let Err(e) = spout.send_buffer(&data, crate::ipc::PixelFormat::BGRA, width, height) {
+                        log::error!("[Spout] send_buffer failed: {}", e);
+                    }
                 }
             }
 
@@ -208,6 +274,8 @@ impl OutputManager {
         self.stop_ndi();
         #[cfg(all(target_os = "macos", feature = "syphon"))]
         self.stop_syphon();
+        #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+        self.stop_spout();
     }
 
     /// Drain readback pool (call when GPU device is still alive).

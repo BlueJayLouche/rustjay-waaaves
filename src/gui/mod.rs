@@ -204,7 +204,14 @@ pub struct ControlGui {
     // Saved Syphon source names from config (for matching after discovery)
     pub saved_syphon_source1: String,
     pub saved_syphon_source2: String,
-    
+
+    // Spout source selection (Windows only)
+    pub spout_sources: Vec<String>,
+    pub selected_spout_source1: i32,
+    pub selected_spout_source2: i32,
+    /// Spout output sender name
+    pub spout_output_name: String,
+
     // Audio device selection
     pub audio_devices: Vec<String>,
     pub selected_audio_device: i32,
@@ -410,6 +417,10 @@ impl ControlGui {
             syphon_discovery: None,
             saved_syphon_source1,
             saved_syphon_source2,
+            spout_sources: Vec::new(),
+            selected_spout_source1: -1,
+            selected_spout_source2: -1,
+            spout_output_name: String::from("RustJay Waaaves"),
             audio_devices,
             selected_audio_device: -1,
             audio_device_dirty: true,
@@ -606,6 +617,19 @@ impl ControlGui {
     fn refresh_syphon_sources(&mut self) {
         self.syphon_sources.clear();
         self.syphon_sources_dirty = false;
+    }
+
+    /// Refresh Spout sender list (Windows only)
+    fn refresh_spout_sources(&mut self) {
+        self.spout_sources.clear();
+        #[cfg(all(target_os = "windows", feature = "ipc-spout"))]
+        {
+            use crate::ipc::IpcDiscovery;
+            let mut discovery = crate::ipc::spout::SpoutDiscovery::new();
+            let sources = discovery.discover_sources(100);
+            self.spout_sources = sources.into_iter().map(|s| s.name).collect();
+            log::debug!("[GUI] Spout sources: {:?}", self.spout_sources);
+        }
     }
 
     fn begin_webcam_refresh(&mut self) {
@@ -4585,7 +4609,18 @@ impl ControlGui {
             if type_changed && self.input1_type == InputType::Syphon {
                 self.refresh_syphon_sources();
             }
-            
+
+            // Auto-select first Spout source if Spout is chosen but no source selected
+            if type_changed && self.input1_type == InputType::Spout
+                && self.selected_spout_source1 < 0 && !self.spout_sources.is_empty() {
+                self.selected_spout_source1 = 0;
+            }
+
+            // Refresh Spout sources when switching to Spout
+            if type_changed && self.input1_type == InputType::Spout {
+                self.refresh_spout_sources();
+            }
+
             // Refresh NDI sources when switching to NDI
             if type_changed && self.input1_type == InputType::Ndi {
                 self.refresh_ndi_sources();
@@ -4753,7 +4788,50 @@ impl ControlGui {
                     }
                 }
             }
-            
+
+            // Spout input source selection (Windows only)
+            if self.input1_type == InputType::Spout {
+                if !self.spout_sources.is_empty() {
+                    let preview = if self.selected_spout_source1 >= 0 &&
+                                     (self.selected_spout_source1 as usize) < self.spout_sources.len() {
+                        self.spout_sources[self.selected_spout_source1 as usize].clone()
+                    } else { "Select Spout sender...".to_string() };
+
+                    let mut selected = self.selected_spout_source1;
+                    ComboBox::new(ui, "##spout1_select")
+                        .preview_value(&preview)
+                        .build(|| {
+                            for (idx, name) in self.spout_sources.iter().enumerate() {
+                                if ui.selectable_config(name).selected(idx == selected as usize).build() {
+                                    selected = idx as i32;
+                                }
+                            }
+                        });
+                    self.selected_spout_source1 = selected;
+
+                    ui.same_line();
+                    if ui.button("Refresh##spout1") {
+                        self.refresh_spout_sources();
+                    }
+
+                    if ui.button("Start Spout Input 1") && self.selected_spout_source1 >= 0 {
+                        let sender_name = self.spout_sources[self.selected_spout_source1 as usize].clone();
+                        log::info!("[GUI] Requesting Spout Input 1: {}", sender_name);
+                        if let Ok(mut state) = self.shared_state.lock() {
+                            state.input1_change_request = InputChangeRequest::StartSpout {
+                                input_id: 1,
+                                sender_name,
+                            };
+                        }
+                    }
+                } else {
+                    ui.text_disabled("No Spout senders found");
+                    if ui.button("Refresh Spout Senders##1") {
+                        self.refresh_spout_sources();
+                    }
+                }
+            }
+
             // Stop button
             if ui.button("Stop Input 1") {
                 if let Ok(mut state) = self.shared_state.lock() {
@@ -4761,7 +4839,7 @@ impl ControlGui {
                 }
             }
         }
-        
+
         // Input 2 section
         if CollapsingHeader::new("Input 2").default_open(true).build(ui) {
             let input_types = ["None", "Webcam", "NDI", "Syphon", "Spout", "Video File"];
@@ -4817,7 +4895,18 @@ impl ControlGui {
             if type_changed && self.input2_type == InputType::Syphon {
                 self.refresh_syphon_sources();
             }
-            
+
+            // Auto-select first Spout source if Spout is chosen but no source selected
+            if type_changed && self.input2_type == InputType::Spout
+                && self.selected_spout_source2 < 0 && !self.spout_sources.is_empty() {
+                self.selected_spout_source2 = 0;
+            }
+
+            // Refresh Spout sources when switching to Spout
+            if type_changed && self.input2_type == InputType::Spout {
+                self.refresh_spout_sources();
+            }
+
             // Stop current input and save config when input type changes
             if type_changed {
                 log::info!("[GUI] Input 2 type changed from {} to {}, stopping current input", 
@@ -4980,7 +5069,50 @@ impl ControlGui {
                     }
                 }
             }
-            
+
+            // Spout input source selection (Windows only)
+            if self.input2_type == InputType::Spout {
+                if !self.spout_sources.is_empty() {
+                    let preview = if self.selected_spout_source2 >= 0 &&
+                                     (self.selected_spout_source2 as usize) < self.spout_sources.len() {
+                        self.spout_sources[self.selected_spout_source2 as usize].clone()
+                    } else { "Select Spout sender...".to_string() };
+
+                    let mut selected = self.selected_spout_source2;
+                    ComboBox::new(ui, "##spout2_select")
+                        .preview_value(&preview)
+                        .build(|| {
+                            for (idx, name) in self.spout_sources.iter().enumerate() {
+                                if ui.selectable_config(name).selected(idx == selected as usize).build() {
+                                    selected = idx as i32;
+                                }
+                            }
+                        });
+                    self.selected_spout_source2 = selected;
+
+                    ui.same_line();
+                    if ui.button("Refresh##spout2") {
+                        self.refresh_spout_sources();
+                    }
+
+                    if ui.button("Start Spout Input 2") && self.selected_spout_source2 >= 0 {
+                        let sender_name = self.spout_sources[self.selected_spout_source2 as usize].clone();
+                        log::info!("[GUI] Requesting Spout Input 2: {}", sender_name);
+                        if let Ok(mut state) = self.shared_state.lock() {
+                            state.input2_change_request = InputChangeRequest::StartSpout {
+                                input_id: 2,
+                                sender_name,
+                            };
+                        }
+                    }
+                } else {
+                    ui.text_disabled("No Spout senders found");
+                    if ui.button("Refresh Spout Senders##2") {
+                        self.refresh_spout_sources();
+                    }
+                }
+            }
+
             // Stop button
             if ui.button("Stop Input 2") {
                 if let Ok(mut state) = self.shared_state.lock() {
@@ -5467,6 +5599,52 @@ impl ControlGui {
             }
         }
         
+        // Spout Output Settings (Windows only)
+        #[cfg(target_os = "windows")]
+        if CollapsingHeader::new("Spout Output (Windows)").default_open(true).build(ui) {
+            let is_active = self.shared_state.lock()
+                .map(|s| s.spout_output_active)
+                .unwrap_or(false);
+
+            // Status indicator
+            if is_active {
+                ui.text_colored([0.0, 1.0, 0.0, 1.0], "● Streaming");
+            } else {
+                ui.text("○ Not streaming");
+            }
+
+            ui.separator();
+
+            // Spout sender name
+            ui.text("Sender Name:");
+            let mut sender_name = self.spout_output_name.clone();
+            ui.input_text("##spout_output_name", &mut sender_name)
+                .build();
+            if sender_name != self.spout_output_name {
+                self.spout_output_name = sender_name;
+            }
+
+            ui.separator();
+
+            // Start/Stop button
+            if is_active {
+                if ui.button("Stop Spout Output") {
+                    if let Ok(mut state) = self.shared_state.lock() {
+                        state.output_command = crate::core::OutputCommand::StopSpout;
+                    }
+                }
+            } else {
+                if ui.button("Start Spout Output") {
+                    let name = self.spout_output_name.clone();
+                    if let Ok(mut state) = self.shared_state.lock() {
+                        state.output_command = crate::core::OutputCommand::StartSpout { name };
+                    }
+                }
+            }
+
+            ui.text_disabled("Spout output streams to other Windows apps (Resolume, OBS, etc.)");
+        }
+
         // Clear feedback button
         if ui.button("Clear Feedback") {
             if let Ok(mut state) = self.shared_state.lock() {

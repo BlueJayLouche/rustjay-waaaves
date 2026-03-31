@@ -73,23 +73,31 @@ imgui = "0.12"
 imgui-wgpu = "0.25"
 imgui-winit-support = "0.13"
 
-# Syphon crates from the upstream git workspace
-# Provides zero-copy GPU-to-GPU Syphon output for macOS
-syphon-core = { git = "https://github.com/BlueJayLouche/syphon-rs.git", package = "syphon-core", optional = true }
-syphon-wgpu = { git = "https://github.com/BlueJayLouche/syphon-rs.git", package = "syphon-wgpu", optional = true }
+# Syphon crates are macOS-only — declared under [target.'cfg(target_os = "macos")'.dependencies] below
 
 
 
 # Platform-specific IPC dependencies
 [target.'cfg(target_os = "macos")'.dependencies]
+# Syphon crates (macOS-only; non-optional so they always link on macOS)
+syphon-core = { git = "https://github.com/BlueJayLouche/syphon-rs.git", package = "syphon-core" }
+syphon-wgpu = { git = "https://github.com/BlueJayLouche/syphon-rs.git", package = "syphon-wgpu" }
 # Metal for zero-copy texture sharing (used by syphon-wgpu)
 metal = { version = "0.31", optional = true }
 # Objective-C runtime for autoreleasepool
 objc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# Spout uses Windows API
-winapi = { version = "0.3", features = ["d3d11", "d3d12", "dxgi", "handleapi"], optional = true }
+# Spout uses Windows API (direct D3D11 shared-memory protocol, no Spout SDK needed)
+windows = { version = "0.61", features = [
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_Security",
+], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # V4L2 for video devices
@@ -103,16 +111,16 @@ codegen-units = 1
 panic = "abort"
 
 [features]
-default = ["webcam", "ipc", "ndi", "syphon"]
+default = ["webcam", "ipc", "syphon"]
 webcam = ["nokhwa"]
 # NDI support (requires NDI runtime to be installed)
 ndi = ["dep:grafton-ndi"]
-# Syphon support (macOS only)
-syphon = ["syphon-core", "syphon-wgpu"]
+# Syphon support (macOS only) — syphon-core/syphon-wgpu are always compiled on macOS
+syphon = []
 # Inter-process video sharing (platform-specific)
 ipc = ["ipc-syphon", "ipc-spout", "ipc-v4l2"]
-ipc-syphon = ["syphon-core", "syphon-wgpu", "metal"]
-ipc-spout = ["winapi"]
+ipc-syphon = ["metal"]
+ipc-spout = ["windows"]
 ipc-v4l2 = ["v4l", "nix"]
 
 [profile.dev]
