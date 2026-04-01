@@ -56,11 +56,25 @@ pub const KEY_MODES: &[&str] = &["Lumakey", "Chromakey"];
 // =============================================================================
 
 /// Audio modulation state for a parameter
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ParamAudioModulation {
     pub enabled: bool,
     pub fft_band: i32,
     pub amount: f32,
+    pub attack: f32,
+    pub release: f32,
+}
+
+impl Default for ParamAudioModulation {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fft_band: 0,
+            amount: 0.0,
+            attack: 0.01,
+            release: 0.15,
+        }
+    }
 }
 
 /// LFO state for a parameter
@@ -6388,9 +6402,19 @@ impl ControlGui {
                     .speed(0.01)
                     .range(-2.0, 2.0)
                     .build(ui, &mut mod_settings.amount);
-                
+
+                // Attack/Release envelope controls
+                Drag::new("Attack (s)")
+                    .speed(0.001)
+                    .range(0.001, 1.0)
+                    .build(ui, &mut mod_settings.attack);
+                Drag::new("Release (s)")
+                    .speed(0.001)
+                    .range(0.001, 1.0)
+                    .build(ui, &mut mod_settings.release);
+
                 ui.separator();
-                
+
                 // Apply button - adds to shared state
                 let mut applied = false;
                 if ui.button("Apply Modulation") {
@@ -6400,9 +6424,10 @@ impl ControlGui {
                             audio_fft_band: mod_settings.fft_band,
                             audio_amount: mod_settings.amount,
                             audio_use_normalization: false,
-                            audio_attack: 0.1,
-                            audio_release: 0.1,
+                            audio_attack: mod_settings.attack,
+                            audio_release: mod_settings.release,
                             audio_range_scale: 1.0,
+                            audio_smoothed_value: 0.0,
                             bpm_enabled: false,
                             bpm_division_index: 2,
                             bpm_phase: 0.0,
@@ -6423,22 +6448,22 @@ impl ControlGui {
                 ui.text("Active Modulations:");
                 
                 // Show active modulations
-                let active_mods: Vec<(String, i32, f32, bool)> = if let Ok(state) = self.shared_state.lock() {
+                let active_mods: Vec<(String, i32, f32, f32, f32, bool)> = if let Ok(state) = self.shared_state.lock() {
                     state.block1_modulations
                         .iter()
-                        .map(|(k, v)| (k.clone(), v.audio_fft_band, v.audio_amount, v.audio_enabled))
+                        .map(|(k, v)| (k.clone(), v.audio_fft_band, v.audio_amount, v.audio_attack, v.audio_release, v.audio_enabled))
                         .collect()
                 } else {
                     Vec::new()
                 };
-                
+
                 if active_mods.is_empty() {
                     ui.text_disabled("No active modulations");
                 } else {
-                    for (key, band, amount, enabled) in active_mods {
+                    for (key, band, amount, attack, release, enabled) in active_mods {
                         let enabled_str = if enabled { "" } else { " [OFF]" };
-                        ui.text(&format!("{}{}: Band {} @ {:.2}x", 
-                            key, enabled_str, band, amount));
+                        ui.text(&format!("{}{}: Band {} @ {:.2}x  A:{:.3} R:{:.3}",
+                            key, enabled_str, band, amount, attack, release));
                         ui.same_line();
                         if ui.small_button(&format!("Remove##b1_{}", key)) {
                             if let Ok(mut state) = self.shared_state.lock() {
@@ -6495,9 +6520,11 @@ impl ControlGui {
                     });
                 mod_settings.fft_band = band_idx_b2.clamp(0, 7) as i32;
                 Drag::new("Modulation Amount##b2").speed(0.01).range(-2.0, 2.0).build(ui, &mut mod_settings.amount);
-                
+                Drag::new("Attack (s)##b2").speed(0.001).range(0.001, 1.0).build(ui, &mut mod_settings.attack);
+                Drag::new("Release (s)##b2").speed(0.001).range(0.001, 1.0).build(ui, &mut mod_settings.release);
+
                 ui.separator();
-                
+
                 let mut applied_b2 = false;
                 if ui.button("Apply Modulation##b2") {
                     if let Ok(mut state) = self.shared_state.lock() {
@@ -6506,9 +6533,10 @@ impl ControlGui {
                             audio_fft_band: mod_settings.fft_band,
                             audio_amount: mod_settings.amount,
                             audio_use_normalization: false,
-                            audio_attack: 0.1,
-                            audio_release: 0.1,
+                            audio_attack: mod_settings.attack,
+                            audio_release: mod_settings.release,
                             audio_range_scale: 1.0,
+                            audio_smoothed_value: 0.0,
                             bpm_enabled: false,
                             bpm_division_index: 2,
                             bpm_phase: 0.0,
@@ -6528,22 +6556,22 @@ impl ControlGui {
                 ui.separator();
                 ui.text("Active Modulations:");
                 
-                let active_mods: Vec<(String, i32, f32, bool)> = if let Ok(state) = self.shared_state.lock() {
+                let active_mods: Vec<(String, i32, f32, f32, f32, bool)> = if let Ok(state) = self.shared_state.lock() {
                     state.block2_modulations
                         .iter()
-                        .map(|(k, v)| (k.clone(), v.audio_fft_band, v.audio_amount, v.audio_enabled))
+                        .map(|(k, v)| (k.clone(), v.audio_fft_band, v.audio_amount, v.audio_attack, v.audio_release, v.audio_enabled))
                         .collect()
                 } else {
                     Vec::new()
                 };
-                
+
                 if active_mods.is_empty() {
                     ui.text_disabled("No active modulations");
                 } else {
-                    for (key, band, amount, enabled) in active_mods {
+                    for (key, band, amount, attack, release, enabled) in active_mods {
                         let enabled_str = if enabled { "" } else { " [OFF]" };
-                        ui.text(&format!("{}{}: Band {} @ {:.2}x", 
-                            key, enabled_str, band, amount));
+                        ui.text(&format!("{}{}: Band {} @ {:.2}x  A:{:.3} R:{:.3}",
+                            key, enabled_str, band, amount, attack, release));
                         ui.same_line();
                         if ui.small_button(&format!("Remove##b2_{}", key)) {
                             if let Ok(mut state) = self.shared_state.lock() {
@@ -6600,9 +6628,11 @@ impl ControlGui {
                     });
                 mod_settings.fft_band = band_idx_b3.clamp(0, 7) as i32;
                 Drag::new("Modulation Amount##b3").speed(0.01).range(-2.0, 2.0).build(ui, &mut mod_settings.amount);
-                
+                Drag::new("Attack (s)##b3").speed(0.001).range(0.001, 1.0).build(ui, &mut mod_settings.attack);
+                Drag::new("Release (s)##b3").speed(0.001).range(0.001, 1.0).build(ui, &mut mod_settings.release);
+
                 ui.separator();
-                
+
                 let mut applied_b3 = false;
                 if ui.button("Apply Modulation##b3") {
                     if let Ok(mut state) = self.shared_state.lock() {
@@ -6611,9 +6641,10 @@ impl ControlGui {
                             audio_fft_band: mod_settings.fft_band,
                             audio_amount: mod_settings.amount,
                             audio_use_normalization: false,
-                            audio_attack: 0.1,
-                            audio_release: 0.1,
+                            audio_attack: mod_settings.attack,
+                            audio_release: mod_settings.release,
                             audio_range_scale: 1.0,
+                            audio_smoothed_value: 0.0,
                             bpm_enabled: false,
                             bpm_division_index: 2,
                             bpm_phase: 0.0,
@@ -6633,22 +6664,22 @@ impl ControlGui {
                 ui.separator();
                 ui.text("Active Modulations:");
                 
-                let active_mods: Vec<(String, i32, f32, bool)> = if let Ok(state) = self.shared_state.lock() {
+                let active_mods: Vec<(String, i32, f32, f32, f32, bool)> = if let Ok(state) = self.shared_state.lock() {
                     state.block3_modulations
                         .iter()
-                        .map(|(k, v)| (k.clone(), v.audio_fft_band, v.audio_amount, v.audio_enabled))
+                        .map(|(k, v)| (k.clone(), v.audio_fft_band, v.audio_amount, v.audio_attack, v.audio_release, v.audio_enabled))
                         .collect()
                 } else {
                     Vec::new()
                 };
-                
+
                 if active_mods.is_empty() {
                     ui.text_disabled("No active modulations");
                 } else {
-                    for (key, band, amount, enabled) in active_mods {
+                    for (key, band, amount, attack, release, enabled) in active_mods {
                         let enabled_str = if enabled { "" } else { " [OFF]" };
-                        ui.text(&format!("{}{}: Band {} @ {:.2}x", 
-                            key, enabled_str, band, amount));
+                        ui.text(&format!("{}{}: Band {} @ {:.2}x  A:{:.3} R:{:.3}",
+                            key, enabled_str, band, amount, attack, release));
                         ui.same_line();
                         if ui.small_button(&format!("Remove##b3_{}", key)) {
                             if let Ok(mut state) = self.shared_state.lock() {

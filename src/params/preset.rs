@@ -21,7 +21,11 @@ pub struct ParamModulationData {
     pub audio_attack: f32,
     pub audio_release: f32,
     pub audio_range_scale: f32,
-    
+
+    // Runtime envelope state (not serialized)
+    #[serde(skip)]
+    pub audio_smoothed_value: f32,
+
     // BPM modulation
     pub bpm_enabled: bool,
     pub bpm_division_index: i32,
@@ -527,19 +531,37 @@ impl Default for PresetManager {
     }
 }
 
-/// Apply audio modulations to parameters
+/// Apply audio modulations to parameters with attack/release envelope following.
+///
+/// Uses asymmetric exponential smoothing: `attack` controls how fast the envelope
+/// rises to follow transients, `release` controls how slowly it decays. This makes
+/// audio-reactive parameters feel more musical and less jittery.
 pub fn apply_audio_modulations(
     base_value: f32,
-    modulation: &ParamModulationData,
+    modulation: &mut ParamModulationData,
     fft_value: f32,
-    _delta_time: f32,
+    delta_time: f32,
 ) -> f32 {
     if !modulation.audio_enabled {
+        modulation.audio_smoothed_value = 0.0;
         return base_value;
     }
-    
-    let mod_amount = fft_value * modulation.audio_amount * modulation.audio_range_scale;
-    base_value + mod_amount
+
+    let target = fft_value * modulation.audio_amount * modulation.audio_range_scale;
+
+    // Asymmetric envelope: use attack when rising, release when falling
+    let smoothing = if target > modulation.audio_smoothed_value {
+        modulation.audio_attack
+    } else {
+        modulation.audio_release
+    };
+
+    // Exponential smoothing (frame-rate independent)
+    let smoothing_factor = (-delta_time / smoothing.max(0.001)).exp();
+    modulation.audio_smoothed_value = modulation.audio_smoothed_value * smoothing_factor
+        + target * (1.0 - smoothing_factor);
+
+    base_value + modulation.audio_smoothed_value
 }
 
 /// Get list of modulated parameters for display
