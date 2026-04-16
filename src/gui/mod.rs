@@ -5425,7 +5425,6 @@ impl ControlGui {
             let mut show_osc = self.config.show_osc_addresses;
             if ui.checkbox("Show OSC addresses on hover", &mut show_osc) {
                 self.config.show_osc_addresses = show_osc;
-                // Save config
                 if let Err(e) = self.config.save() {
                     log::warn!("Failed to save config: {}", e);
                 }
@@ -5433,6 +5432,54 @@ impl ControlGui {
             if ui.is_item_hovered() {
                 ui.tooltip_text("When enabled, hover over any parameter to see its OSC address for remote control");
             }
+
+            ui.separator();
+
+            // Receive port
+            ui.text("Receive Port:");
+            ui.same_line();
+            let mut recv_port = self.config.control.osc_receive_port as i32;
+            ui.set_next_item_width(100.0);
+            if ui.input_int("##osc_recv_port", &mut recv_port).build() {
+                let new_port = recv_port.clamp(1024, 65535) as u16;
+                if new_port != self.config.control.osc_receive_port {
+                    self.config.control.osc_receive_port = new_port;
+                    if let Err(e) = self.config.save() {
+                        log::warn!("Failed to save config: {}", e);
+                    }
+                }
+            }
+
+            // Send port
+            ui.text("Send Port:");
+            ui.same_line();
+            let mut send_port = self.config.control.osc_send_port as i32;
+            ui.set_next_item_width(100.0);
+            if ui.input_int("##osc_send_port", &mut send_port).build() {
+                let new_port = send_port.clamp(1024, 65535) as u16;
+                if new_port != self.config.control.osc_send_port {
+                    self.config.control.osc_send_port = new_port;
+                    if let Err(e) = self.config.save() {
+                        log::warn!("Failed to save config: {}", e);
+                    }
+                }
+            }
+
+            // Send IP
+            ui.text("Send IP:");
+            ui.same_line();
+            let mut send_ip = self.config.control.osc_send_ip.clone();
+            ui.set_next_item_width(150.0);
+            if ui.input_text("##osc_send_ip", &mut send_ip).build() {
+                if send_ip != self.config.control.osc_send_ip {
+                    self.config.control.osc_send_ip = send_ip;
+                    if let Err(e) = self.config.save() {
+                        log::warn!("Failed to save config: {}", e);
+                    }
+                }
+            }
+
+            ui.text_disabled("Changes take effect on next launch");
         }
         
         // Preview Window Settings
