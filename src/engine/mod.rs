@@ -78,6 +78,7 @@ struct App {
     control_gui: Option<ControlGui>,
     imgui_renderer: Option<ImGuiRenderer>,
     control_needs_redraw: bool,
+    control_occluded: bool,
     control_active_until: Option<std::time::Instant>,
     control_last_frame_time: Option<std::time::Instant>,
     control_target_frame_duration: std::time::Duration,
@@ -147,6 +148,7 @@ impl App {
             control_gui: None,
             imgui_renderer: None,
             control_needs_redraw: true,
+            control_occluded: false,
             control_active_until: None,
             control_last_frame_time: None,
             control_target_frame_duration: std::time::Duration::from_secs_f64(1.0 / control_fps.max(1) as f64),
@@ -770,11 +772,9 @@ impl ApplicationHandler for App {
                             engine.resize(size.width, size.height);
                         }
                     }
-                    WindowEvent::RedrawRequested => {
-                        if let Some(ref mut engine) = self.output_engine {
-                            engine.render(self.output_occluded);
-                        }
-                    }
+                    // Rendering is done in about_to_wait() to ensure continuous
+                    // output even when the control window is occluded/covered.
+                    // The OS throttles RedrawRequested for occluded windows.
                     _ => {}
                 }
                 return;
@@ -829,29 +829,36 @@ impl ApplicationHandler for App {
                         }
                         self.control_needs_redraw = true;
                     }
+                    WindowEvent::Occluded(occluded) => {
+                        self.control_occluded = occluded;
+                    }
                     WindowEvent::RedrawRequested => {
-                        // Render imgui
-                        if let (Some(ref mut renderer), Some(ref mut gui)) = 
-                            (self.imgui_renderer.as_mut(), self.control_gui.as_mut()) 
-                        {
-                            // Check for UI scale changes from shared state
-                            if let Ok(state) = self.shared_state.lock() {
-                                let desired_scale = state.ui_scale;
-                                if (renderer.ui_scale() - desired_scale).abs() > 0.01 {
-                                    renderer.set_ui_scale(desired_scale);
+                        // Skip rendering when occluded — on macOS/Metal, get_current_texture()
+                        // (nextDrawable) can block for ~1 second on an occluded window,
+                        // stalling the event loop and dropping output window FPS.
+                        if !self.control_occluded {
+                            if let (Some(ref mut renderer), Some(ref mut gui)) =
+                                (self.imgui_renderer.as_mut(), self.control_gui.as_mut())
+                            {
+                                // Check for UI scale changes from shared state
+                                if let Ok(state) = self.shared_state.lock() {
+                                    let desired_scale = state.ui_scale;
+                                    if (renderer.ui_scale() - desired_scale).abs() > 0.01 {
+                                        renderer.set_ui_scale(desired_scale);
+                                    }
+                                }
+
+                                // Update display size and render
+                                let window_size = control_window.inner_size();
+                                renderer.set_display_size(window_size.width as f32, window_size.height as f32);
+
+                                if let Err(err) = renderer.render_frame(|ui| gui.build_ui(ui)) {
+                                    eprintln!("ImGui render error: {}", err);
                                 }
                             }
-                            
-                            // Update display size and render
-                            let window_size = control_window.inner_size();
-                            renderer.set_display_size(window_size.width as f32, window_size.height as f32);
-                            
-                            if let Err(err) = renderer.render_frame(|ui| gui.build_ui(ui)) {
-                                eprintln!("ImGui render error: {}", err);
-                            }
+                            self.control_last_frame_time = Some(std::time::Instant::now());
                         }
                         self.control_needs_redraw = false;
-                        self.control_last_frame_time = Some(std::time::Instant::now());
                     }
                     _ => {}
                 }
@@ -1272,21 +1279,23 @@ impl ApplicationHandler for App {
             };
             let active = self.control_active_until.is_some_and(|until| now < until);
             
-            if self.control_needs_redraw || active || idle_due {
+            if !self.control_occluded && (self.control_needs_redraw || active || idle_due) {
                 window.request_redraw();
             }
         }
         
-        // Request redraw for output window.
-        // Always request redraws even when occluded — the render function
-        // skips only the surface blit, keeping outputs streaming.
-        if let Some(ref window) = self.output_window {
+        // Render the output window directly here rather than via request_redraw().
+        // The OS throttles RedrawRequested events when the control window is occluded
+        // or covered by another app, dropping output FPS. Rendering in about_to_wait()
+        // bypasses that throttle and keeps output continuous regardless of window focus.
+        if self.output_engine.is_some() {
             if self.output_vsync_enabled {
-                // VSync mode: let the display compositor be the throttle.
-                // Always request redraw; present() will block to refresh rate.
-                window.request_redraw();
+                // VSync mode: present() blocks to the display refresh rate — just render every loop.
+                if let Some(ref mut engine) = self.output_engine {
+                    engine.render(self.output_occluded);
+                }
             } else {
-                // Software frame limiter: only render when target duration has elapsed.
+                // Software frame limiter: only render when the target duration has elapsed.
                 let now = std::time::Instant::now();
                 let should_render = match self.output_last_frame_time {
                     None => true,
@@ -1296,9 +1305,9 @@ impl ApplicationHandler for App {
                 if should_render {
                     self.output_last_frame_time = Some(now);
                     self.output_next_frame_time = now + self.output_target_frame_duration;
-                    window.request_redraw();
-                    use winit::event_loop::ControlFlow;
-                    event_loop.set_control_flow(ControlFlow::Poll);
+                    if let Some(ref mut engine) = self.output_engine {
+                        engine.render(self.output_occluded);
+                    }
                 } else {
                     use winit::event_loop::ControlFlow;
                     event_loop.set_control_flow(ControlFlow::WaitUntil(self.output_next_frame_time));
